@@ -163,8 +163,16 @@ do:
 
 ### Running the Harvester Automatically (Cronjob) 
 
-You can also use them for the 
+You can also use them for the automatic harvesting usng cronjobs. 
 
+In your `crontab -e` call the harvester from the ckan venv user. (Below example is from the default)
+
+        00 12 * * * /usr/lib/ckan/default/bin/ckan ckan -c /etc/ckan/default/ckan.ini harvester job <source-id> 
+       
+        05 12 * * * /usr/lib/ckan/default/bin/ckan ckan -c /etc/ckan/default/ckan.ini harvester run  
+
+
+This will create and run the job for a given harvest source ID 
 
 ## Tests
 
