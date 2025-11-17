@@ -2,6 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/../ckanext-datapackager/.idea/ckanext-datapackager.iml" filepath="$PROJECT_DIR$/../ckanext-datapackager/.idea/ckanext-datapackager.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/ckanext-harvester4chem.iml" filepath="$PROJECT_DIR$/.idea/ckanext-harvester4chem.iml" />
     </modules>
   </component>
