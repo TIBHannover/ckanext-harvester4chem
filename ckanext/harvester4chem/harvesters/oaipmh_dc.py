@@ -332,7 +332,15 @@ class OaipmhDCHarvester(HarvesterBase):
             package_dict["language"] = content['language']
 
             package_dict["metadata_modified"] = content['metadata_modified']
-            package_dict["measurement_technique"] = content['source']
+            uncleaned_measurement_technique = content['source']
+
+            if uncleaned_measurement_technique:
+                cleaned_measurement_technique = uncleaned_measurement_technique[1]
+                package_dict['measurement_technique'] = cleaned_measurement_technique
+            else:
+                package_dict['measurement_technique'] = 'Unknown Instrument'
+
+            log.debug(package_dict['measurement_technique'])
 
             # add license
             package_dict["license_id"] = self._extract_license_id(context=context, content=content)
