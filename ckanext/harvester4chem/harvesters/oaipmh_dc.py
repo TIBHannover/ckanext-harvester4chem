@@ -317,6 +317,7 @@ class OaipmhDCHarvester(HarvesterBase):
                 except (IndexError, KeyError):
                     continue
 
+            package_dict['title'] = self.normalize_field(package_dict['title'])
             # add author
             package_dict["author"] = self._extract_author(content)
 
@@ -329,14 +330,14 @@ class OaipmhDCHarvester(HarvesterBase):
 
             # doi
             package_dict["doi"] = content['identifier'][0]
-            package_dict["language"] = content['language']
+            package_dict["language"] = self.normalize_field(content['language'])
 
             package_dict["metadata_modified"] = content['metadata_modified']
             uncleaned_measurement_technique = content['source']
 
             if uncleaned_measurement_technique:
                 cleaned_measurement_technique = uncleaned_measurement_technique[1]
-                package_dict['measurement_technique'] = cleaned_measurement_technique
+                package_dict['measurement_technique'] = self.normalize_field(cleaned_measurement_technique)
             else:
                 package_dict['measurement_technique'] = 'Unknown Instrument'
 
@@ -481,7 +482,7 @@ class OaipmhDCHarvester(HarvesterBase):
                 resource_format = "HTML"
             resources.append(
                 {
-                    "name": content["title"][0],
+                    "name": self.normalize_field(content["title"][0]),
                     "resource_type": resource_format,
                     "format": resource_format,
                     "url": url,
@@ -523,3 +524,14 @@ class OaipmhDCHarvester(HarvesterBase):
 
         log.debug("Group ids: %s" % group_ids)
         return group_ids
+
+    def normalize_field(self,value):
+        if not value:
+            return None
+        if isinstance(value, list):
+            # strip and join multi-value DC title fields safely
+            cleaned = [v.strip().strip('"').strip("'") for v in value if v.strip()]
+            return " ".join(cleaned) if len(cleaned) > 1 else cleaned[0]
+        if isinstance(value, str):
+            return value.strip().strip('"').strip("'")
+        return value
