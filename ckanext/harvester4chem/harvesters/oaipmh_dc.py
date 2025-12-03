@@ -4,7 +4,7 @@ from urllib.error import HTTPError
 import traceback
 from datetime import datetime
 from datetime import timedelta
-
+import re
 from ckan.model import Session
 from ckan.logic import get_action
 from ckan import model
@@ -336,10 +336,11 @@ class OaipmhDCHarvester(HarvesterBase):
             uncleaned_measurement_technique = content['source']
 
             if uncleaned_measurement_technique:
-                cleaned_measurement_technique = uncleaned_measurement_technique[1]
-                package_dict['measurement_technique'] = self.normalize_field(cleaned_measurement_technique)
+                package_dict['measurement_technique'] = self.extract_instrument_name(uncleaned_measurement_technique)
+
+                # package_dict['measurement_technique'] = self.normalize_field(cleaned_measurement_technique)
             else:
-                package_dict['measurement_technique'] = 'Unknown Instrument'
+                package_dict['measurement_technique'] = 'Unknown'
 
             log.debug(package_dict['measurement_technique'])
 
@@ -535,3 +536,43 @@ class OaipmhDCHarvester(HarvesterBase):
         if isinstance(value, str):
             return value.strip().strip('"').strip("'")
         return value
+
+    def extract_instrument_name(self,source_list):
+        """
+        Extract a short instrument name from source texts.
+        If only placeholders exist, return 'Unknown'.
+        If long descriptive text exists, extract brand + model.
+        """
+        PLACEHOLDER_VALUES = {"instrument", "unknown", "n/a", ""}
+        if not source_list:
+            return "Unknown"
+
+        # Remove placeholders like "Instrument"
+        texts = [s.strip() for s in source_list if s.strip().lower() not in PLACEHOLDER_VALUES]
+
+        if not texts:
+            return "Unknown"
+
+        # Combine texts
+        text = " ".join(texts)
+
+        # Try to extract "Brand Model ..." patterns
+        # e.g. Bruker Avance III HD 400, Viscotek GPCmax VE-2001, ALV/CGS-3, Miniscope MS 400
+        pattern = r"""
+            (?P<brand>[A-Z][A-Za-z0-9/+\-]+)       # Brand or manufacturer
+            (?:\s+[A-Za-z0-9/+\-]+){0,4}           # 1-4 tokens of model
+        """
+
+        candidates = re.findall(pattern, text, re.VERBOSE)
+
+        if candidates:
+            # Return the first usable name
+            name = " ".join(candidates[0].split()[:3])  # shorten to 3 tokens
+            return name.strip()
+
+        # If no structured match found, fallback: first noun-like phrase
+        fallback = re.search(r"[A-Z][A-Za-z0-9/+\- ]{4,50}", text)
+        if fallback:
+            return fallback.group(0).strip()
+
+        return "Unknown"
