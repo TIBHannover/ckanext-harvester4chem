@@ -460,7 +460,6 @@ class OaipmhHarvester(HarvesterBase):
         content_license = ", ".join(content["rights"])
         license_list = get_action('license_list')(context.copy(), {})
         for license_name in license_list:
-
             if content_license == license_name['id'] or content_license == license_name['url'] or content_license == \
                     license_name['title']:
                 package_license = license_name['id']
@@ -656,7 +655,7 @@ class OaipmhHarvester(HarvesterBase):
 
             # if there is no molecule at all, it inserts rows into molecules and molecule_rel_data dt
             if not molecule_id:
-                molecules.create(standard_inchi, smiles, inchi_key, exact_mass, mol_formula)
+                molecules.create(standard_inchi, smiles, inchi_key, exact_mass, mol_formula) # smiles = canonical_smiles in db
                 new_molecules_id = molecules._get_inchi_from_db(inchi_key)
                 new_molecules_id = new_molecules_id[0]
 
