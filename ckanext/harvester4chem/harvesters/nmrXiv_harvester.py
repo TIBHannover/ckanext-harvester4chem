@@ -483,7 +483,12 @@ class NMRxIVBioSchema(HarvesterBase):
     def _send_to_db(self, package, content):
 
         """
-        sends the molecule information and all other information to database directly.
+        Sends the molecule information and all other information to database directly.
+
+        Important:
+        Molecules are considered the same only when both inchi_key and
+        canonical_smiles are the same. This prevents duplicate rows in the
+        molecules table for the same molecule representation.
         """
 
         package_id = package['id']
@@ -491,39 +496,93 @@ class NMRxIVBioSchema(HarvesterBase):
         try:
             standard_inchi = content['inChI']
             inchi_key = content['inChIKey']
-            smiles_a = content['smiles']
-            log.debug(f'here smiles looks like when harvester SMILES: {smiles_a}')
-            smiles = next((item for item in smiles_a if item is not None), 'n/a')
-            exact_mass = content['molecularWeight']
+            canonical_smiles = content['smiles']
+            log.debug(
+                "Canonical SMILES from Chemotion harvester: %s",
+                canonical_smiles
+            )
+
+            exact_mass = content['molecularWeight']['value']
             mol_formula = content['molecularFormula']
 
-            # Check if the row already exists, if not then INSERT
-            molecule_id = molecules._get_inchi_from_db(inchi_key)
-            log.debug(f"Current molecule_d  {molecule_id}")
-            relation_value = mol_rel_data.get_mol_formula_by_package_id(package_id)
-            log.debug(f"Here is the relation {relation_value}")
+            # Find an existing molecule by the real molecule identity:
+            # inchi_key + canonical_smiles.
+            #
+            # NOTE:
+            # Use molecules.canonical_smiles if the rdkit_visuals model has
+            # already been renamed from smiles -> canonical_smiles.
+            existing_molecule = (
+                Session.query(molecules.id)
+                .filter(molecules.inchi_key == inchi_key)
+                .filter(molecules.canonical_smiles == canonical_smiles)
+                .first()
+            )
 
-            if not molecule_id:  # if there is no molecule at all, it inserts rows into molecules and molecule_rel_data dt
-                molecules.create(standard_inchi, smiles, inchi_key, exact_mass, mol_formula) # smiles = canocial_smiles in db
-                new_molecules_id = molecules._get_inchi_from_db(inchi_key)
-                new_molecules_id = new_molecules_id[0]
-                # Check if relaionship exists
-                log.debug(f"New molecule {new_molecules_id}")
-                mol_rel_data.create(new_molecules_id, package_id)
-                log.debug('data sent to molecules and relation db')
+            if existing_molecule:
+                molecule_id = existing_molecule[0]
+                log.debug(
+                    "Existing molecule found for inchi_key=%s and canonical_smiles=%s: %s",
+                    inchi_key,
+                    canonical_smiles,
+                    molecule_id
+                )
+            else:
+                log.debug(
+                    "Creating new molecule for inchi_key=%s and canonical_smiles=%s",
+                    inchi_key,
+                    canonical_smiles
+                )
 
-            elif not relation_value:  # if the molecule exists, but the relation doesn't exist, it create the relation
-                # with molecule ID
-                log.debug("Relationship must be created")
-                mol_rel_data.create(molecule_id[0], package_id)
-                log.debug('data sent to mol_relation db')
-            else:  # if the both exists
-                log.debug('Nothing to insert. Already existing')
+                molecules.create(
+                    standard_inchi,
+                    canonical_smiles,
+                    inchi_key,
+                    exact_mass,
+                    mol_formula
+                )
+
+                existing_molecule = (
+                    Session.query(molecules.id)
+                    .filter(molecules.inchi_key == inchi_key)
+                    .filter(molecules.canonical_smiles == canonical_smiles)
+                    .first()
+                )
+
+                if not existing_molecule:
+                    log.error(
+                        "Molecule was created but could not be found again for inchi_key=%s and canonical_smiles=%s",
+                        inchi_key,
+                        canonical_smiles
+                    )
+                    return 0
+
+                molecule_id = existing_molecule[0]
+                log.debug("New molecule created with id=%s", molecule_id)
+
+            # Check whether this exact molecule-package relation already exists.
+            relation_exists = (
+                Session.query(mol_rel_data.id)
+                .filter(mol_rel_data.molecules_id == molecule_id)
+                .filter(mol_rel_data.package_id == package_id)
+                .first()
+            )
+
+            if not relation_exists:
+                mol_rel_data.create(molecule_id, package_id)
+                log.debug(
+                    "Created molecule relation: molecules_id=%s, package_id=%s",
+                    molecule_id,
+                    package_id
+                )
+            else:
+                log.debug(
+                    "Molecule relation already exists: molecules_id=%s, package_id=%s",
+                    molecule_id,
+                    package_id
+                )
 
         except Exception as e:
-            if e:
-                log.error(f'Sent to db not possible because of this error {e}')
-                pass
-            else:
-                pass
+            log.error(f'Sent to db not possible because of this error {e}')
+            pass
+
         return 0

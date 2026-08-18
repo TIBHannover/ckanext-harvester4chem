@@ -40,12 +40,6 @@ from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 log = logging.getLogger(__name__)
 
-DB_HOST = "localhost"
-DB_USER = "ckan_default"
-DB_NAME = "ckan_default"
-DB_pwd = "123456789"
-
-
 class OaipmhHarvester(HarvesterBase):
     """
     OAI-PMH Harvester for DataCite Metadata and repositories!

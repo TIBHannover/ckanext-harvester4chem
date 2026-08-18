@@ -1,6 +1,9 @@
 .ropeproject
 node_modules
 bower_components
+.env
+.env.*
+!.env.example
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

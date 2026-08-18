@@ -40,13 +40,6 @@ from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 log = logging.getLogger(__name__)
 
 
-DB_HOST = "localhost"
-DB_USER = "ckan_default"
-DB_NAME = "ckan_default"
-DB_pwd = "123456789"
-
-
-
 class BioSchemaMUHarvester(HarvesterBase):
     """ Trying use this extension to scarp data from available sitemap URLs.
     In this extension we map scrapped data with CKAN and Bioschema.org from Massbank (Only through scrapping) """
@@ -465,10 +458,8 @@ class BioSchemaMUHarvester(HarvesterBase):
             name_list.append([package_id,alternatenames])
 
         # connect to db
-        con = psycopg2.connect(user=DB_USER,
-                               host=DB_HOST,
-                               password=DB_pwd,
-                               dbname=DB_NAME)
+        # libpq reads PGHOST, PGPORT, PGDATABASE, PGUSER and PGPASSWORD.
+        con = psycopg2.connect()
 
         con.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
 
@@ -503,7 +494,6 @@ class BioSchemaMUHarvester(HarvesterBase):
         con.close()
         log.debug('data sent to db')
         return 0
-
 
 
 

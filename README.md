@@ -4,6 +4,12 @@
 
 # ckanext-harvester4chem
 
+Direct PostgreSQL connections use libpq configuration from `PGHOST`,
+`PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD` (or a secure `.pgpass`). No
+password fallback is embedded in the extension. Load a protected external
+environment file with `set -a; . /etc/ckan/harvester.env; set +a` before
+starting CKAN; `python-dotenv` is not required.
+
 A unified CKAN extension that brings together multiple specialised harvesters tailored for chemistry-related research data.
 This project consolidates several separate harvester implementations—each designed for a different metadata source, schema, or API—into a single, organised extension.
 
