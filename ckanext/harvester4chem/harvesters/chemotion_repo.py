@@ -18,8 +18,7 @@ from ckan.model import Session
 from ckan.logic import get_action
 from ckan import model
 
-from ckanext.rdkit_visuals.models.molecule_tab import Molecules as molecules
-from ckanext.rdkit_visuals.models.molecule_rel import MolecularRelationData as mol_rel_data
+from ckanext.harvester4chem.molecule_sync import synchronize_harvested_package
 
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckan.lib.munge import munge_tag
@@ -287,20 +286,26 @@ class ChemotionRepoHarvester(HarvesterBase):
 
             # creating package
             log.debug("Create/update package using dict: %s" % package_dict)
-            self._create_or_update_package(
+            transaction = Session.begin_nested()
+            package_result = self._create_or_update_package(
                 package_dict, harvest_object, "package_show"
             )
-
+            if not package_result:
+                raise RuntimeError("CKAN package create/update failed")
+            synchronize_harvested_package(
+                package_dict, harvest_object,
+                names=[content.get('name'), content_hasBioPart.get('iupacName')],
+                name_source="Chemotion",
+            )
             rebuild(package_dict["name"])
+            if transaction.is_active:
+                transaction.commit()
             Session.commit()
-
-            log.debug(f"content has about has biopart {content_hasBioPart}")
-
-            self._send_to_db(package=package_dict, content=content_hasBioPart)
 
             log.debug("Finished record")
 
         except Exception as e:
+            Session.rollback()
             log.exception(e)
             self._save_object_error(
                 "Exception in fetch stage for %s: %r / %s"
@@ -562,110 +567,3 @@ class ChemotionRepoHarvester(HarvesterBase):
                 package_license = license_name['id']
 
         return package_license
-
-    def _send_to_db(self, package, content):
-
-        """
-        Sends the molecule information and all other information to database directly.
-
-        Important:
-        Molecules are considered the same only when both inchi_key and
-        canonical_smiles are the same. This prevents duplicate rows in the
-        molecules table for the same molecule representation.
-        """
-
-        package_id = package['id']
-
-        try:
-            standard_inchi = content['inChI']
-            inchi_key = content['inChIKey']
-            canonical_smiles = content['smiles']
-            log.debug(
-                "Canonical SMILES from Chemotion harvester: %s",
-                canonical_smiles
-            )
-
-            exact_mass = content['molecularWeight']['value']
-            mol_formula = content['molecularFormula']
-
-            # Find an existing molecule by the real molecule identity:
-            # inchi_key + canonical_smiles.
-            #
-            # NOTE:
-            # Use molecules.canonical_smiles if the rdkit_visuals model has
-            # already been renamed from smiles -> canonical_smiles.
-            existing_molecule = (
-                Session.query(molecules.id)
-                .filter(molecules.inchi_key == inchi_key)
-                .filter(molecules.canonical_smiles == canonical_smiles)
-                .first()
-            )
-
-            if existing_molecule:
-                molecule_id = existing_molecule[0]
-                log.debug(
-                    "Existing molecule found for inchi_key=%s and canonical_smiles=%s: %s",
-                    inchi_key,
-                    canonical_smiles,
-                    molecule_id
-                )
-            else:
-                log.debug(
-                    "Creating new molecule for inchi_key=%s and canonical_smiles=%s",
-                    inchi_key,
-                    canonical_smiles
-                )
-
-                molecules.create(
-                    standard_inchi,
-                    canonical_smiles,
-                    inchi_key,
-                    exact_mass,
-                    mol_formula
-                )
-
-                existing_molecule = (
-                    Session.query(molecules.id)
-                    .filter(molecules.inchi_key == inchi_key)
-                    .filter(molecules.canonical_smiles == canonical_smiles)
-                    .first()
-                )
-
-                if not existing_molecule:
-                    log.error(
-                        "Molecule was created but could not be found again for inchi_key=%s and canonical_smiles=%s",
-                        inchi_key,
-                        canonical_smiles
-                    )
-                    return 0
-
-                molecule_id = existing_molecule[0]
-                log.debug("New molecule created with id=%s", molecule_id)
-
-            # Check whether this exact molecule-package relation already exists.
-            relation_exists = (
-                Session.query(mol_rel_data.id)
-                .filter(mol_rel_data.molecules_id == molecule_id)
-                .filter(mol_rel_data.package_id == package_id)
-                .first()
-            )
-
-            if not relation_exists:
-                mol_rel_data.create(molecule_id, package_id)
-                log.debug(
-                    "Created molecule relation: molecules_id=%s, package_id=%s",
-                    molecule_id,
-                    package_id
-                )
-            else:
-                log.debug(
-                    "Molecule relation already exists: molecules_id=%s, package_id=%s",
-                    molecule_id,
-                    package_id
-                )
-
-        except Exception as e:
-            log.error(f'Sent to db not possible because of this error {e}')
-            pass
-
-        return 0
