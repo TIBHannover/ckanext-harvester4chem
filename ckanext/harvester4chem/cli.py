@@ -24,33 +24,45 @@ VERIFY_SQL = {
     "dataset_chemistry_missing_molecule_package": text("""
         SELECT count(DISTINCT p.id) FROM package p
         JOIN package_extra dk ON dk.package_id=p.id AND dk.key='inchi_key'
-        LEFT JOIN package_extra mk ON mk.key='inchi_key'
-          AND upper(btrim(mk.value))=upper(btrim(dk.value))
+          AND dk.state='active' AND dk.value IS NOT NULL AND btrim(dk.value)<>''
+        LEFT JOIN package_extra mk ON mk.key='inchi_key' AND mk.state='active'
+          AND mk.value IS NOT NULL AND btrim(mk.value)<>''
+          AND upper(trim(both '"' from btrim(mk.value)))=
+              upper(trim(both '"' from btrim(dk.value)))
         LEFT JOIN package mp ON mp.id=mk.package_id AND mp.type='molecule'
           AND mp.state='active'
         WHERE p.state='active' AND p.type<>'molecule' AND mp.id IS NULL
     """),
     "ambiguous_duplicate_molecule_packages": text("""
         SELECT count(*) FROM (
-          SELECT upper(btrim(e.value)) FROM package p
+          SELECT upper(trim(both '"' from btrim(e.value))) FROM package p
           JOIN package_extra e ON e.package_id=p.id AND e.key='inchi_key'
+            AND e.state='active'
           WHERE p.type='molecule' AND p.state='active'
-          GROUP BY upper(btrim(e.value)) HAVING count(DISTINCT p.id)>1
+            AND e.value IS NOT NULL AND btrim(e.value)<>''
+          GROUP BY upper(trim(both '"' from btrim(e.value)))
+          HAVING count(DISTINCT p.id)>1
         ) duplicate
     """),
     "molecule_packages_missing_rdk_molecule": text("""
         SELECT count(DISTINCT p.id) FROM package p
         JOIN package_extra i ON i.package_id=p.id AND i.key='inchi'
-        LEFT JOIN rdk.molecules m ON m.inchi_code=btrim(i.value)
+          AND i.state='active' AND i.value IS NOT NULL AND btrim(i.value)<>''
+        LEFT JOIN rdk.molecules m
+          ON m.inchi_code=trim(both '"' from btrim(i.value))
         WHERE p.type='molecule' AND p.state='active' AND m.molecule_id IS NULL
     """),
     "molecule_packages_with_rdkit_inchi_key_mismatch": text("""
         SELECT count(*) FROM package p
         JOIN package_extra i ON i.package_id=p.id AND i.key='inchi'
+          AND i.state='active' AND i.value IS NOT NULL AND btrim(i.value)<>''
         JOIN package_extra k ON k.package_id=p.id AND k.key='inchi_key'
-        JOIN rdk.molecules m ON m.inchi_code=btrim(i.value)
+          AND k.state='active' AND k.value IS NOT NULL AND btrim(k.value)<>''
+        JOIN rdk.molecules m
+          ON m.inchi_code=trim(both '"' from btrim(i.value))
         WHERE p.type='molecule' AND p.state='active'
-          AND upper(btrim(k.value))<>upper(coalesce(m.inchi_key,''))
+          AND upper(trim(both '"' from btrim(k.value)))<>
+              upper(coalesce(m.inchi_key,''))
     """),
     "rdk_molecules_missing_fingerprints": text("""
         SELECT count(*) FROM rdk.molecules m LEFT JOIN rdk.fingerprints f
@@ -62,12 +74,29 @@ VERIFY_SQL = {
     "dataset_molecule_package_relationships_missing": text("""
         SELECT count(DISTINCT d.id) FROM package d
         JOIN package_extra dk ON dk.package_id=d.id AND dk.key='inchi_key'
-        JOIN package_extra mk ON mk.key='inchi_key'
-          AND upper(btrim(mk.value))=upper(btrim(dk.value))
-        JOIN package mp ON mp.id=mk.package_id AND mp.type='molecule' AND mp.state='active'
-        LEFT JOIN relationship_relationship r ON r.subject_id=d.id
-          AND r.object_id=mp.id AND r.relation_type='related_to'
-        WHERE d.state='active' AND d.type<>'molecule' AND r.id IS NULL
+          AND dk.state='active' AND dk.value IS NOT NULL AND btrim(dk.value)<>''
+        WHERE d.state='active' AND d.type<>'molecule'
+          AND EXISTS (
+            SELECT 1 FROM package_extra mk
+            JOIN package mp ON mp.id=mk.package_id
+              AND mp.type='molecule' AND mp.state='active'
+            WHERE mk.key='inchi_key' AND mk.state='active'
+              AND mk.value IS NOT NULL AND btrim(mk.value)<>''
+              AND upper(trim(both '"' from btrim(mk.value)))=
+                  upper(trim(both '"' from btrim(dk.value)))
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM relationship_relationship r
+            JOIN package mp ON (mp.id=r.object_id OR mp.name=r.object_id)
+              AND mp.type='molecule' AND mp.state='active'
+            JOIN package_extra mk ON mk.package_id=mp.id
+              AND mk.key='inchi_key' AND mk.state='active'
+              AND mk.value IS NOT NULL AND btrim(mk.value)<>''
+            WHERE (r.subject_id=d.id OR r.subject_id=d.name)
+              AND r.relation_type='related_to'
+              AND upper(trim(both '"' from btrim(mk.value)))=
+                  upper(trim(both '"' from btrim(dk.value)))
+          )
     """),
     "ckan_relationships_referencing_inactive_or_missing_packages": text("""
         SELECT count(*) FROM relationship_relationship r

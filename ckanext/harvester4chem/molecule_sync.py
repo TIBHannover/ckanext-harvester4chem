@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid
 
 from sqlalchemy import text
@@ -12,6 +13,10 @@ from rdkit.Chem import inchi as rd_inchi
 log = logging.getLogger(__name__)
 MOLECULE_PACKAGE_TYPE = "molecule"
 DATASET_MOLECULE_RELATION = "related_to"
+TECHNICAL_MOLECULE_NAME = re.compile(
+    r"^(?:nfdi4chem-mol[0-9]+|molecule-[a-z0-9-]+)"
+    r"(?: \(unknown molecule\))?$", re.IGNORECASE
+)
 
 
 class MoleculeSyncError(Exception):
@@ -24,6 +29,23 @@ def clean_value(value):
     if isinstance(value, str):
         value = value.strip()
     return value if value != "" else None
+
+
+def normalize_chemical_text(value):
+    """Normalize text and unwrap a valid JSON-encoded string safely."""
+    value = clean_value(value)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        decoded = value
+    if isinstance(decoded, str):
+        decoded = decoded.strip()
+        return decoded or None
+    return value
 
 
 def clean_names(values):
@@ -43,12 +65,29 @@ def clean_names(values):
     return result
 
 
+def _chemical_display_name(value, inchi_key):
+    value = clean_value(value)
+    if not value or value.upper() == inchi_key:
+        return None
+    if TECHNICAL_MOLECULE_NAME.match(value):
+        return None
+    return value
+
+
 def normalize_structure(inchi_code=None, inchi_key=None, smiles=None,
                         mol_formula=None, exact_mass=None):
-    inchi_code, inchi_key = clean_value(inchi_code), clean_value(inchi_key)
-    smiles = clean_value(smiles)
-    molecule = (rd_inchi.MolFromInchi(inchi_code) if inchi_code else
-                Chem.MolFromSmiles(smiles) if smiles else None)
+    inchi_code = normalize_chemical_text(inchi_code)
+    inchi_key = normalize_chemical_text(inchi_key)
+    smiles = normalize_chemical_text(smiles)
+    molecule = None
+    if inchi_code:
+        molecule = rd_inchi.MolFromInchi(inchi_code)
+        if molecule is None:
+            log.warning("HARVESTER4CHEM could not parse supplied InChI; trying SMILES")
+    if molecule is None and smiles:
+        molecule = Chem.MolFromSmiles(smiles)
+        if molecule is None:
+            log.warning("HARVESTER4CHEM could not parse supplied SMILES")
     if molecule is None:
         raise MoleculeSyncError("invalid or missing InChI/SMILES")
     canonical = Chem.MolToSmiles(molecule, canonical=True)
@@ -80,7 +119,10 @@ def synchronize_legacy_molecule_relation(package_id, values, session=None):
     session = session or model.Session
     rows = session.execute(text("""
         SELECT id, canonical_smiles FROM public.molecules
-        WHERE upper(btrim(inchi_key)) = :inchi_key OR btrim(inchi) = :inchi_code
+        WHERE (inchi_key IS NOT NULL AND btrim(inchi_key)<>'' AND
+               upper(trim(both '"' from btrim(inchi_key))) = :inchi_key)
+           OR (inchi IS NOT NULL AND btrim(inchi)<>'' AND
+               trim(both '"' from btrim(inchi)) = :inchi_code)
         ORDER BY id
     """), values).fetchall()
     exact = []
@@ -124,8 +166,9 @@ def _package_value(package, key):
     if value is not None:
         return clean_value(value)
     for extra in package.get("extras") or []:
-        if extra.get("key") == key:
-            return clean_value(extra.get("value"))
+        if (extra.get("key") == key and
+                extra.get("state", "active") == "active"):
+            return normalize_chemical_text(extra.get("value"))
     return None
 
 
@@ -134,7 +177,9 @@ def _candidate_ids(session, inchi_key):
         SELECT DISTINCT p.id FROM public.package p
         JOIN public.package_extra e ON e.package_id=p.id
         WHERE p.type='molecule' AND p.state='active'
-          AND e.key='inchi_key' AND upper(btrim(e.value))=:inchi_key
+          AND e.state='active' AND e.key='inchi_key'
+          AND e.value IS NOT NULL AND btrim(e.value)<>''
+          AND upper(trim(both '"' from btrim(e.value)))=:inchi_key
         ORDER BY p.id
     """), {"inchi_key": inchi_key}).fetchall()
 
@@ -150,10 +195,19 @@ def _package_values(package):
         _package_value(package, "exact_mass"))
 
 
+def _allocate_molecule_package_name():
+    """Preserve ``nfdi4chem-mol<number>`` with a vast random namespace.
+
+    CKAN's package-name unique constraint remains the concurrency arbiter.
+    A collision fails the transaction safely instead of using MAX()+1.
+    """
+    return "nfdi4chem-mol{0}".format(uuid.uuid4().int)
+
+
 def _package_payload(values, names):
     names = clean_names(names)
     return {"id": str(uuid.uuid4()),
-            "name": "molecule-{0}".format(values["inchi_key"].lower()),
+            "name": _allocate_molecule_package_name(),
             "title": names[0] if names else values["inchi_key"],
             "type": "molecule", "state": "active",
             "inchi": values["inchi_code"], "inchi_key": values["inchi_key"],
@@ -196,7 +250,7 @@ def ensure_molecule_package(values, names=None, session=None,
         return payload, [], True
     package = action_getter("package_create")(
         {"model": model, "session": session, "ignore_auth": True,
-         "user": "harvest"}, payload)
+         "user": "harvest", "defer_commit": True}, payload)
     return package, [], True
 
 
@@ -234,7 +288,8 @@ def synchronize_molecule_package_with_rdk(package, session=None,
         alternate = json.loads(alternate) if isinstance(alternate, str) else alternate
     except (TypeError, ValueError):
         pass
-    names = clean_names([package.get("title"), package.get("name")] + clean_names(alternate))
+    title = _chemical_display_name(package.get("title"), values["inchi_key"])
+    names = clean_names([title] + clean_names(alternate))
     for name in names:
         params = {"molecule_id": molecule_id, "name": name,
                   "source": clean_value(name_source) or "CKAN"}
@@ -251,19 +306,22 @@ def synchronize_molecule_package_with_rdk(package, session=None,
 
 def ensure_dataset_molecule_package_relationship(dataset_id, molecule_id,
                                                  action_getter=None,
-                                                 dry_run=False):
+                                                 dry_run=False,
+                                                 molecule_name=None):
     action_getter = action_getter or toolkit.get_action
     context = {"model": model, "session": model.Session,
                "ignore_auth": True, "user": "harvest"}
     relations = action_getter("relationship_relations_list")(
         context, {"subject_id": dataset_id}) or []
-    exists = any(item.get("object_id") == molecule_id and
+    object_refs = {molecule_id, molecule_name} - {None}
+    exists = any(item.get("object_id") in object_refs and
                  item.get("relation_type") == DATASET_MOLECULE_RELATION
                  for item in relations)
     if not exists and not dry_run:
-        action_getter("relationship_relation_create")(
-            context, {"subject_id": dataset_id, "object_id": molecule_id,
-                      "relation_type": DATASET_MOLECULE_RELATION})
+        raise MoleculeSyncError(
+            "new CKAN relationship blocked: installed "
+            "relationship_relation_create commits independently"
+        )
     return "existing" if exists else "created"
 
 
@@ -284,7 +342,8 @@ def synchronize_molecule(package_id, inchi_code=None, inchi_key=None,
         rdk_molecule_id = synchronize_molecule_package_with_rdk(
             package, session, name_source)
         relation = ensure_dataset_molecule_package_relationship(
-            package_id, package["id"], action_getter, dry_run)
+            package_id, package["id"], action_getter, dry_run,
+            molecule_name=package.get("name"))
         result = {"legacy": legacy, "molecule_package_id": package["id"],
                   "molecule_package": "created" if created else "existing",
                   "duplicate_molecule_package_ids": duplicates,

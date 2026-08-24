@@ -1,4 +1,5 @@
 import copy
+import os
 
 import pytest
 
@@ -88,10 +89,12 @@ class Actions(object):
         self.packages = {}
         self.relations = []
         self.calls = []
+        self.contexts = []
 
     def get(self, name):
         def action(context, data):
             self.calls.append((name, copy.deepcopy(data)))
+            self.contexts.append((name, copy.copy(context)))
             if name == "package_show":
                 return self.packages[data["id"]]
             if name == "package_create":
@@ -116,8 +119,58 @@ def run(session, actions, **overrides):
     return molecule_sync.synchronize_molecule(**values)
 
 
+def existing_package(session, actions, names=None):
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    package = molecule_sync._package_payload(values, names or ["Ethanol"])
+    package["name"] = "nfdi4chem-mol12345"
+    actions.packages[package["id"]] = package
+    session.candidate_ids = [package["id"]]
+    actions.relations.append({"subject_id": "dataset-id",
+                              "object_id": package["id"],
+                              "relation_type": "related_to"})
+    return package
+
+
+def test_normalize_chemical_text_handles_json_and_whitespace():
+    assert molecule_sync.normalize_chemical_text(None) is None
+    assert molecule_sync.normalize_chemical_text('  "{0}"  '.format(
+        ETHANOL_INCHI)) == ETHANOL_INCHI
+    assert molecule_sync.normalize_chemical_text("  CCO  ") == "CCO"
+
+
+def test_quoted_inchi_is_parsed():
+    values = molecule_sync.normalize_structure(
+        inchi_code=' "{0}" '.format(ETHANOL_INCHI))
+    assert values["inchi_key"] == ETHANOL_KEY
+
+
+def test_invalid_inchi_falls_back_to_valid_smiles(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(molecule_sync.log, "warning",
+                        lambda message, *args: warnings.append(message))
+    values = molecule_sync.normalize_structure("not-inchi", smiles=" CCO ")
+    assert values["inchi_key"] == ETHANOL_KEY
+    assert any("could not parse supplied InChI" in item for item in warnings)
+
+
+def test_supplied_inchi_key_mismatch_fails():
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
+        molecule_sync.normalize_structure(
+            inchi_code=ETHANOL_INCHI,
+            inchi_key="AAAAAAAAAAAAAA-BBBBBBBBBB-C")
+
+
+def test_inchi_key_mismatch_performs_no_write():
+    session, actions = FakeSession(), Actions()
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
+        run(session, actions, inchi_key="AAAAAAAAAAAAAA-BBBBBBBBBB-C")
+    assert not any(session.state.values())
+    assert actions.calls == []
+
+
 def test_workflow_keeps_legacy_and_rdkit_identifiers_separate():
     session, actions = FakeSession(), Actions()
+    existing_package(session, actions)
     result = run(session, actions)
     assert result["legacy"]["legacy_molecule_id"] == 10
     assert result["rdk_molecule_id"] == 101
@@ -128,26 +181,53 @@ def test_workflow_keeps_legacy_and_rdkit_identifiers_separate():
     assert 101 not in inserts[0][1].values()
 
 
+def test_existing_legacy_molecule_is_reused():
+    session = FakeSession()
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    session.state["legacy"][77] = copy.deepcopy(values)
+    result = molecule_sync.synchronize_legacy_molecule_relation(
+        "dataset-id", values, session)
+    assert result["status"] == "existing"
+    assert result["legacy_molecule_id"] == 77
+    assert session.state["legacy_rel"] == {("dataset-id", 77)}
+
+
 def test_package_and_ckan_relationship_are_created_in_correct_direction():
     session, actions = FakeSession(), Actions()
-    result = run(session, actions)
-    package = actions.packages[result["molecule_package_id"]]
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    package, _, created = molecule_sync.ensure_molecule_package(
+        values, names=["Ethanol"], session=session,
+        action_getter=actions.get)
+    assert created is True
     assert package["type"] == "molecule"
-    assert package["name"] == "molecule-" + ETHANOL_KEY.lower()
-    assert actions.relations == [{"subject_id": "dataset-id",
-                                  "object_id": package["id"],
-                                  "relation_type": "related_to"}]
+    assert package["name"].startswith("nfdi4chem-mol")
+    assert package["name"][len("nfdi4chem-mol"):].isdigit()
+    create_call = [call for call in actions.calls if call[0] == "package_create"]
+    assert create_call
+    create_context = [context for name, context in actions.contexts
+                      if name == "package_create"][0]
+    assert create_context["defer_commit"] is True
+
+
+def test_new_relationship_write_is_blocked_before_committing_action():
+    actions = Actions()
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="commits independently"):
+        molecule_sync.ensure_dataset_molecule_package_relationship(
+            "dataset-id", "molecule-id", action_getter=actions.get)
+    assert not any(name == "relationship_relation_create"
+                   for name, _ in actions.calls)
 
 
 def test_second_execution_is_idempotent():
     session, actions = FakeSession(), Actions()
+    package = existing_package(session, actions)
     first = run(session, actions)
-    session.candidate_ids = [first["molecule_package_id"]]
     second = run(session, actions, names=["ethanol"])
     assert second["molecule_package"] == "existing"
     assert len(session.state["legacy"]) == 1
     assert len(session.state["legacy_rel"]) == 1
-    assert len(actions.packages) == 1
+    assert list(actions.packages) == [package["id"]]
     assert len(actions.relations) == 1
     assert len(session.state["rdk"]) == 1
     assert len(session.state["fingerprints"]) == 1
@@ -165,6 +245,34 @@ def test_rdk_is_synchronized_from_molecule_package_metadata():
     assert result == 101
     assert stored["inchi_key"] == ETHANOL_KEY
     assert (101, "Package title") in session.state["names"]
+
+
+def test_technical_package_name_is_not_inserted_as_synonym():
+    session = FakeSession()
+    package = molecule_sync._package_payload(
+        molecule_sync.normalize_structure(smiles="CCO"), ["Ethanol"])
+    package["name"] = "nfdi4chem-mol12345"
+    package["title"] = package["name"]
+    molecule_sync.synchronize_molecule_package_with_rdk(package, session)
+    assert (101, "nfdi4chem-mol12345") not in session.state["names"]
+    assert (101, "Ethanol") in session.state["names"]
+
+
+def test_inactive_package_extra_is_ignored():
+    package = {"extras": [
+        {"key": "inchi_key", "value": "inactive", "state": "deleted"},
+        {"key": "inchi_key", "value": ETHANOL_KEY, "state": "active"},
+    ]}
+    assert molecule_sync._package_value(package, "inchi_key") == ETHANOL_KEY
+
+
+def test_candidate_lookup_requires_active_nonblank_extras():
+    session = FakeSession()
+    molecule_sync._candidate_ids(session, ETHANOL_KEY)
+    sql = session.sql[-1][0]
+    assert "e.state='active'" in sql
+    assert "e.value IS NOT NULL" in sql
+    assert "btrim(e.value)<>''" in sql
 
 
 def test_exact_duplicate_packages_reuse_one_and_report_others():
@@ -214,3 +322,20 @@ def test_invalid_input_fails_before_any_write():
         run(session, actions, inchi_code=None, inchi_key=None,
             smiles="not a molecule")
     assert not any(session.state.values())
+
+
+@pytest.mark.skipif(
+    os.environ.get("HARVESTER4CHEM_TEST_RDK") != "1",
+    reason="set HARVESTER4CHEM_TEST_RDK=1 only for an isolated RDKit test DB",
+)
+def test_postgresql_rdkit_functions_available():
+    from sqlalchemy import text
+    import ckan.model as model
+
+    row = model.Session.execute(text("""
+        SELECT mol_to_smiles(mol_from_smiles(CAST('CCO' AS cstring))),
+               morganbv_fp(mol_from_smiles(CAST('CCO' AS cstring))) IS NOT NULL
+    """)).fetchone()
+    model.Session.rollback()
+    assert row[0] == "CCO"
+    assert row[1] is True

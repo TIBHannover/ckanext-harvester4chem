@@ -19,3 +19,10 @@ def test_verification_queries_are_read_only_and_cover_required_checks():
     assert "UPDATE " not in sql
     assert "DELETE " not in sql
     assert "M.MOLECULE_ID = R.MOLECULES_ID" not in sql
+    assert "PACKAGE_EXTRA" in sql
+    assert "STATE='ACTIVE'" in sql
+    missing_relationship_sql = str(
+        VERIFY_SQL["dataset_molecule_package_relationships_missing"]
+    ).upper()
+    assert "NOT EXISTS" in missing_relationship_sql
+    assert "LEFT JOIN RELATIONSHIP_RELATIONSHIP" not in missing_relationship_sql
