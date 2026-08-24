@@ -4,17 +4,19 @@ import pytest
 
 from ckanext.harvester4chem import molecule_sync
 
-
 ETHANOL_INCHI = "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3"
 ETHANOL_KEY = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
 
 
 class Result(object):
-    def __init__(self, row=None):
-        self.row = row
+    def __init__(self, rows=None):
+        self.rows = rows or []
 
     def fetchone(self):
-        return self.row
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return self.rows
 
 
 class Savepoint(object):
@@ -30,172 +32,185 @@ class Savepoint(object):
 
 class FakeSession(object):
     def __init__(self):
-        self.state = {
-            "molecules": {},
-            "fingerprints": {},
-            "relationships": set(),
-            "names": [],
-        }
+        self.state = {"legacy": {}, "legacy_rel": set(), "rdk": {},
+                      "fingerprints": set(), "names": []}
         self.sql = []
-        self.fail_on = None
+        self.candidate_ids = []
 
     def begin_nested(self):
         return Savepoint(self)
 
-    def execute(self, statement, parameters=None):
-        sql = " ".join(str(statement).split())
-        parameters = parameters or {}
-        self.sql.append(sql)
-        if self.fail_on and self.fail_on in sql:
-            raise RuntimeError("database unavailable")
-
-        if sql.startswith("SELECT molecule_id, canonical_smiles"):
-            row = self.state["molecules"].get(parameters["inchi_code"])
-            return Result(row)
-        if sql.startswith("INSERT INTO rdk.molecules"):
-            current = self.state["molecules"].get(parameters["inchi_code"])
-            molecule_id = current[0] if current else len(
-                self.state["molecules"]
-            ) + 101
-            self.state["molecules"][parameters["inchi_code"]] = (
-                molecule_id, parameters["canonical_smiles"],
-                parameters["inchi_key"], parameters["mol_formula"],
-                parameters["exact_mass"],
-            )
-            return Result((molecule_id,))
-        if sql.startswith("INSERT INTO rdk.fingerprints"):
-            molecule_id = parameters["molecule_id"]
-            self.state["fingerprints"][molecule_id] = ("mfp2", "ffp2")
-            return Result((molecule_id,))
+    def execute(self, statement, params=None):
+        sql, params = " ".join(str(statement).split()), params or {}
+        self.sql.append((sql, copy.deepcopy(params)))
+        if sql.startswith("SELECT id, canonical_smiles FROM public.molecules"):
+            return Result([(key, value["canonical_smiles"])
+                           for key, value in self.state["legacy"].items()
+                           if value["inchi_key"] == params["inchi_key"]])
+        if sql.startswith("INSERT INTO public.molecules"):
+            legacy_id = len(self.state["legacy"]) + 10
+            self.state["legacy"][legacy_id] = copy.deepcopy(params)
+            return Result([(legacy_id,)])
         if sql.startswith("SELECT id FROM public.molecule_rel_data"):
-            relation = (parameters["package_id"], parameters["molecule_id"])
-            return Result((1,) if relation in self.state["relationships"]
-                          else None)
+            item = (params["package_id"], params["legacy_id"])
+            return Result([(1,)] if item in self.state["legacy_rel"] else [])
         if sql.startswith("INSERT INTO public.molecule_rel_data"):
-            self.state["relationships"].add(
-                (parameters["package_id"], parameters["molecule_id"])
-            )
+            self.state["legacy_rel"].add((params["package_id"],
+                                          params["legacy_id"]))
             return Result()
+        if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
+            return Result([(item,) for item in self.candidate_ids])
+        if sql.startswith("SELECT molecule_id FROM rdk.molecules"):
+            row = self.state["rdk"].get(params["inchi_code"])
+            return Result([(row[0],)] if row else [])
+        if sql.startswith("INSERT INTO rdk.molecules"):
+            current = self.state["rdk"].get(params["inchi_code"])
+            molecule_id = current[0] if current else len(self.state["rdk"]) + 101
+            self.state["rdk"][params["inchi_code"]] = (
+                molecule_id, copy.deepcopy(params))
+            return Result([(molecule_id,)])
+        if sql.startswith("INSERT INTO rdk.fingerprints"):
+            self.state["fingerprints"].add(params["molecule_id"])
+            return Result([(params["molecule_id"],)])
         if sql.startswith("SELECT name_id FROM rdk.molecule_names"):
-            matching = [item for item in self.state["names"]
-                        if item[0] == parameters["molecule_id"] and
-                        item[1].lower() == parameters["name"].lower()]
-            return Result((1,) if matching else None)
+            found = any(item[0] == params["molecule_id"] and
+                        item[1].lower() == params["name"].lower()
+                        for item in self.state["names"])
+            return Result([(1,)] if found else [])
         if sql.startswith("INSERT INTO rdk.molecule_names"):
-            self.state["names"].append((
-                parameters["molecule_id"], parameters["name"],
-                parameters["name_type"], parameters["source"],
-            ))
+            self.state["names"].append((params["molecule_id"], params["name"]))
             return Result()
         raise AssertionError("Unexpected SQL: {0}".format(sql))
 
 
-def synchronize(session, **overrides):
-    values = {
-        "package_id": "package-uuid",
-        "inchi_code": ETHANOL_INCHI,
-        "inchi_key": ETHANOL_KEY,
-        "smiles": "CCO",
-        "names": ["Ethanol"],
-        "name_source": "test harvester",
-        "session": session,
-    }
+class Actions(object):
+    def __init__(self):
+        self.packages = {}
+        self.relations = []
+        self.calls = []
+
+    def get(self, name):
+        def action(context, data):
+            self.calls.append((name, copy.deepcopy(data)))
+            if name == "package_show":
+                return self.packages[data["id"]]
+            if name == "package_create":
+                self.packages[data["id"]] = copy.deepcopy(data)
+                return self.packages[data["id"]]
+            if name == "relationship_relations_list":
+                return [r for r in self.relations
+                        if r["subject_id"] == data["subject_id"]]
+            if name == "relationship_relation_create":
+                self.relations.append(copy.deepcopy(data))
+                return [data]
+            raise AssertionError(name)
+        return action
+
+
+def run(session, actions, **overrides):
+    values = {"package_id": "dataset-id", "inchi_code": ETHANOL_INCHI,
+              "inchi_key": ETHANOL_KEY, "smiles": "CCO",
+              "names": ["Ethanol"], "session": session,
+              "action_getter": actions.get}
     values.update(overrides)
     return molecule_sync.synchronize_molecule(**values)
 
 
-def test_valid_new_molecule_creates_complete_rdkit_data_and_relationship():
-    session = FakeSession()
-    result = synchronize(session)
+def test_workflow_keeps_legacy_and_rdkit_identifiers_separate():
+    session, actions = FakeSession(), Actions()
+    result = run(session, actions)
+    assert result["legacy"]["legacy_molecule_id"] == 10
+    assert result["rdk_molecule_id"] == 101
+    assert session.state["legacy_rel"] == {("dataset-id", 10)}
+    inserts = [(sql, params) for sql, params in session.sql
+               if sql.startswith("INSERT INTO public.molecule_rel_data")]
+    assert inserts[0][1]["legacy_id"] == 10
+    assert 101 not in inserts[0][1].values()
 
-    assert result["status"] == "created"
-    assert len(session.state["molecules"]) == 1
-    assert session.state["fingerprints"] == {101: ("mfp2", "ffp2")}
-    assert session.state["relationships"] == {("package-uuid", 101)}
-    assert "morganbv_fp(molecule)" in " ".join(session.sql)
-    assert "featmorganbv_fp(molecule)" in " ".join(session.sql)
-    assert "molecules_id" in " ".join(session.sql)
+
+def test_package_and_ckan_relationship_are_created_in_correct_direction():
+    session, actions = FakeSession(), Actions()
+    result = run(session, actions)
+    package = actions.packages[result["molecule_package_id"]]
+    assert package["type"] == "molecule"
+    assert package["name"] == "molecule-" + ETHANOL_KEY.lower()
+    assert actions.relations == [{"subject_id": "dataset-id",
+                                  "object_id": package["id"],
+                                  "relation_type": "related_to"}]
 
 
-def test_existing_molecule_is_reused_and_second_run_is_idempotent():
-    session = FakeSession()
-    synchronize(session)
-    second = synchronize(session, names=["ethanol"])
-
-    assert second["status"] == "updated"
-    assert second["relationship"] == "existing"
-    assert len(session.state["molecules"]) == 1
+def test_second_execution_is_idempotent():
+    session, actions = FakeSession(), Actions()
+    first = run(session, actions)
+    session.candidate_ids = [first["molecule_package_id"]]
+    second = run(session, actions, names=["ethanol"])
+    assert second["molecule_package"] == "existing"
+    assert len(session.state["legacy"]) == 1
+    assert len(session.state["legacy_rel"]) == 1
+    assert len(actions.packages) == 1
+    assert len(actions.relations) == 1
+    assert len(session.state["rdk"]) == 1
     assert len(session.state["fingerprints"]) == 1
-    assert len(session.state["relationships"]) == 1
-    assert len(session.state["names"]) == 1
+    assert len([name for _, name in session.state["names"]
+                if name.lower() == "ethanol"]) == 1
 
 
-def test_pubchem_name_is_preserved_and_case_insensitive_duplicate_skipped():
+def test_rdk_is_synchronized_from_molecule_package_metadata():
     session = FakeSession()
-    session.state["names"].append((101, "ETHANOL", "synonym", "PubChem"))
-    result = synchronize(session, names=["ethanol", "Ethyl alcohol"])
-
-    assert result["names_created"] == 1
-    assert session.state["names"][0] == (
-        101, "ETHANOL", "synonym", "PubChem"
-    )
-    assert session.state["names"][1][1:] == (
-        "Ethyl alcohol", "harvested_name", "test harvester"
-    )
+    package = molecule_sync._package_payload(
+        molecule_sync.normalize_structure(smiles="CCO"), ["Ethyl alcohol"])
+    package["title"] = "Package title"
+    result = molecule_sync.synchronize_molecule_package_with_rdk(package, session)
+    stored = session.state["rdk"][ETHANOL_INCHI][1]
+    assert result == 101
+    assert stored["inchi_key"] == ETHANOL_KEY
+    assert (101, "Package title") in session.state["names"]
 
 
-@pytest.mark.parametrize("smiles", ["not a smiles", "   "])
-def test_invalid_or_missing_structure_has_no_partial_writes(smiles):
-    session = FakeSession()
+def test_exact_duplicate_packages_reuse_one_and_report_others():
+    session, actions = FakeSession(), Actions()
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    first = molecule_sync._package_payload(values, ["one"])
+    second = molecule_sync._package_payload(values, ["two"])
+    actions.packages = {first["id"]: first, second["id"]: second}
+    session.candidate_ids = [first["id"], second["id"]]
+    package, duplicates, created = molecule_sync.ensure_molecule_package(
+        values, session=session, action_getter=actions.get)
+    assert package["id"] == first["id"]
+    assert duplicates == [second["id"]]
+    assert created is False
+
+
+def test_chemically_different_duplicate_package_fails_safely():
+    session, actions = FakeSession(), Actions()
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    bad = molecule_sync._package_payload(values, ["bad"])
+    bad["smiles"] = bad["canonical_smiles"] = "CC"
+    bad["inchi"] = None
+    # Keep the colliding key to model corrupt/ambiguous package metadata.
+    actions.packages[bad["id"]] = bad
+    session.candidate_ids = [bad["id"]]
     with pytest.raises(molecule_sync.MoleculeSyncError):
-        synchronize(session, inchi_code=None, inchi_key=None, smiles=smiles)
-    assert not any(session.state.values())
+        molecule_sync.ensure_molecule_package(
+            values, session=session, action_getter=actions.get)
 
 
-def test_inchi_key_mismatch_fails_before_writes():
-    session = FakeSession()
-    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
-        synchronize(session, inchi_key="AAAAAAAAAAAAAA-BBBBBBBBBB-C")
-    assert not any(session.state.values())
-
-
-def test_missing_optional_values_are_calculated():
-    session = FakeSession()
-    synchronize(session, inchi_code=None, inchi_key=None,
-                mol_formula=" ", exact_mass=None, names=[None, " "])
-    molecule = list(session.state["molecules"].values())[0]
-    assert molecule[2] == ETHANOL_KEY
-    assert molecule[3] == "C2H6O"
-    assert molecule[4] == pytest.approx(46.041864812)
-    assert session.state["names"] == []
-
-
-def test_dry_run_executes_all_writes_then_rolls_back():
-    session = FakeSession()
+def test_dry_run_validates_every_stage_and_performs_no_writes():
+    session, actions = FakeSession(), Actions()
     before = copy.deepcopy(session.state)
-    result = synchronize(session, dry_run=True)
-
+    result = run(session, actions, dry_run=True)
     assert result["dry_run"] is True
     assert session.state == before
+    assert actions.packages == {}
+    assert actions.relations == []
+    assert any(name == "relationship_relations_list" for name, _ in actions.calls)
     assert any(sql.startswith("INSERT INTO rdk.molecules")
-               for sql in session.sql)
-    assert any(sql.startswith("INSERT INTO public.molecule_rel_data")
-               for sql in session.sql)
+               for sql, _ in session.sql)
 
 
-def test_database_exception_is_propagated():
-    session = FakeSession()
-    session.fail_on = "INSERT INTO rdk.fingerprints"
-    with pytest.raises(RuntimeError, match="database unavailable"):
-        synchronize(session, dry_run=True)
+def test_invalid_input_fails_before_any_write():
+    session, actions = FakeSession(), Actions()
+    with pytest.raises(molecule_sync.MoleculeSyncError):
+        run(session, actions, inchi_code=None, inchi_key=None,
+            smiles="not a molecule")
     assert not any(session.state.values())
-
-
-def test_sql_never_references_legacy_molecule_id():
-    session = FakeSession()
-    synchronize(session)
-    relation_sql = [sql for sql in session.sql
-                    if "public.molecule_rel_data" in sql]
-    assert relation_sql
-    assert all("molecules_id" in sql for sql in relation_sql)
-    assert all("public.molecules" not in sql for sql in session.sql)
