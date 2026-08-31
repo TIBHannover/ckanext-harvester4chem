@@ -21,17 +21,70 @@ VERIFY_SQL = {
           GROUP BY package_id,molecules_id HAVING count(*) > 1
         ) duplicate
     """),
+    # Authoritative migration check: follow the legacy dataset-to-chemical
+    # relationship and ask whether that chemical identity has been migrated
+    # to at least one active CKAN molecule package.
     "dataset_chemistry_missing_molecule_package": text("""
-        SELECT count(DISTINCT p.id) FROM package p
-        JOIN package_extra dk ON dk.package_id=p.id AND dk.key='inchi_key'
-          AND dk.state='active' AND dk.value IS NOT NULL AND btrim(dk.value)<>''
-        LEFT JOIN package_extra mk ON mk.key='inchi_key' AND mk.state='active'
-          AND mk.value IS NOT NULL AND btrim(mk.value)<>''
-          AND upper(trim(both '"' from btrim(mk.value)))=
-              upper(trim(both '"' from btrim(dk.value)))
-        LEFT JOIN package mp ON mp.id=mk.package_id AND mp.type='molecule'
-          AND mp.state='active'
-        WHERE p.state='active' AND p.type<>'molecule' AND mp.id IS NULL
+        WITH dataset_molecule_keys AS (
+          SELECT DISTINCT
+            rel.package_id AS dataset_id,
+            upper(btrim(btrim(btrim(legacy.inchi_key), '"')))
+              AS normalized_inchi_key
+          FROM public.molecule_rel_data rel
+          JOIN public.molecules legacy ON legacy.id=rel.molecules_id
+          JOIN public.package dataset ON dataset.id=rel.package_id
+            AND dataset.type='dataset' AND dataset.state='active'
+          WHERE legacy.inchi_key IS NOT NULL
+            AND btrim(legacy.inchi_key)<>''
+        )
+        SELECT count(*) FROM dataset_molecule_keys dm
+        WHERE dm.normalized_inchi_key<>''
+          AND NOT EXISTS (
+            SELECT 1 FROM public.package molecule_package
+            JOIN public.package_extra molecule_key
+              ON molecule_key.package_id=molecule_package.id
+              AND molecule_key.key='inchi_key'
+              AND molecule_key.state='active'
+            WHERE molecule_package.type='molecule'
+              AND molecule_package.state='active'
+              AND molecule_key.value IS NOT NULL
+              AND btrim(molecule_key.value)<>''
+              AND upper(btrim(btrim(btrim(molecule_key.value), '"')))=
+                  dm.normalized_inchi_key
+          )
+    """),
+    # Broader metadata audit: dataset InChIKey extras are not authoritative
+    # legacy relationships, but inconsistencies remain useful diagnostics.
+    "dataset_extra_inchikey_missing_molecule_package": text("""
+        WITH dataset_extra_keys AS (
+          SELECT DISTINCT
+            dataset.id AS dataset_id,
+            upper(btrim(btrim(btrim(dataset_key.value), '"')))
+              AS normalized_inchi_key
+          FROM public.package dataset
+          JOIN public.package_extra dataset_key
+            ON dataset_key.package_id=dataset.id
+            AND dataset_key.key='inchi_key'
+            AND dataset_key.state='active'
+          WHERE dataset.type='dataset' AND dataset.state='active'
+            AND dataset_key.value IS NOT NULL
+            AND btrim(dataset_key.value)<>''
+        )
+        SELECT count(*) FROM dataset_extra_keys de
+        WHERE de.normalized_inchi_key<>''
+          AND NOT EXISTS (
+            SELECT 1 FROM public.package molecule_package
+            JOIN public.package_extra molecule_key
+              ON molecule_key.package_id=molecule_package.id
+              AND molecule_key.key='inchi_key'
+              AND molecule_key.state='active'
+            WHERE molecule_package.type='molecule'
+              AND molecule_package.state='active'
+              AND molecule_key.value IS NOT NULL
+              AND btrim(molecule_key.value)<>''
+              AND upper(btrim(btrim(btrim(molecule_key.value), '"')))=
+                  de.normalized_inchi_key
+          )
     """),
     "ambiguous_duplicate_molecule_packages": text("""
         SELECT count(*) FROM (
