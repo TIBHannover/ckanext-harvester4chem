@@ -13,8 +13,7 @@ from ckan.model import Session
 from ckan.logic import get_action
 from ckan import model
 
-from ckanext.rdkit_visuals.models.molecule_tab import Molecules as molecules
-from ckanext.rdkit_visuals.models.molecule_rel import MolecularRelationData as mol_rel_data
+from ckanext.harvester4chem.molecule_sync import synchronize_harvested_package
 
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckan.lib.munge import munge_tag
@@ -254,18 +253,26 @@ class NMRxIVBioSchema(HarvesterBase):
 
             # creating package
             log.debug("Create/update package using dict: %s" % package_dict)
-            self._create_or_update_package(
+            transaction = Session.begin_nested()
+            package_result = self._create_or_update_package(
                 package_dict, harvest_object, "package_show"
             )
-
+            if not package_result:
+                raise RuntimeError("CKAN package create/update failed")
+            synchronize_harvested_package(
+                package_dict, harvest_object,
+                names=[content.get('name')],
+                name_source="nmrXiv",
+            )
             rebuild(package_dict["name"])
+            if transaction.is_active:
+                transaction.commit()
             Session.commit()
-
-            self._send_to_db(package=package_dict, content=content_hasBioPart)
 
             log.debug("Finished record")
 
         except Exception as e:
+            Session.rollback()
             log.exception(e)
             self._save_object_error(
                 "Exception in fetch stage for %s: %r / %s"
@@ -479,51 +486,3 @@ class NMRxIVBioSchema(HarvesterBase):
                 package_license = license_name['id']
 
         return package_license
-
-    def _send_to_db(self, package, content):
-
-        """
-        sends the molecule information and all other information to database directly.
-        """
-
-        package_id = package['id']
-
-        try:
-            standard_inchi = content['inChI']
-            inchi_key = content['inChIKey']
-            smiles_a = content['smiles']
-            log.debug(f'here smiles looks like when harvester SMILES: {smiles_a}')
-            smiles = next((item for item in smiles_a if item is not None), 'n/a')
-            exact_mass = content['molecularWeight']
-            mol_formula = content['molecularFormula']
-
-            # Check if the row already exists, if not then INSERT
-            molecule_id = molecules._get_inchi_from_db(inchi_key)
-            log.debug(f"Current molecule_d  {molecule_id}")
-            relation_value = mol_rel_data.get_mol_formula_by_package_id(package_id)
-            log.debug(f"Here is the relation {relation_value}")
-
-            if not molecule_id:  # if there is no molecule at all, it inserts rows into molecules and molecule_rel_data dt
-                molecules.create(standard_inchi, smiles, inchi_key, exact_mass, mol_formula) # smiles = canocial_smiles in db
-                new_molecules_id = molecules._get_inchi_from_db(inchi_key)
-                new_molecules_id = new_molecules_id[0]
-                # Check if relaionship exists
-                log.debug(f"New molecule {new_molecules_id}")
-                mol_rel_data.create(new_molecules_id, package_id)
-                log.debug('data sent to molecules and relation db')
-
-            elif not relation_value:  # if the molecule exists, but the relation doesn't exist, it create the relation
-                # with molecule ID
-                log.debug("Relationship must be created")
-                mol_rel_data.create(molecule_id[0], package_id)
-                log.debug('data sent to mol_relation db')
-            else:  # if the both exists
-                log.debug('Nothing to insert. Already existing')
-
-        except Exception as e:
-            if e:
-                log.error(f'Sent to db not possible because of this error {e}')
-                pass
-            else:
-                pass
-        return 0

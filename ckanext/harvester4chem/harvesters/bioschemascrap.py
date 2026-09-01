@@ -15,7 +15,7 @@ from ckan.logic import get_action
 from ckan import model
 
 from ckanext.related_resources.models.related_resources import RelatedResources as related_resources
-from ckanext.rdkit_visuals.models.molecule_rel import MolecularRelationData as molecule_rel
+from ckanext.harvester4chem.molecule_sync import synchronize_harvested_package
 
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckan.lib.munge import munge_tag
@@ -34,17 +34,7 @@ from bs4 import BeautifulSoup
 import requests
 import re
 
-import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-
 log = logging.getLogger(__name__)
-
-
-DB_HOST = "localhost"
-DB_USER = "ckan_default"
-DB_NAME = "ckan_default"
-DB_pwd = "123456789"
-
 
 
 class BioSchemaMUHarvester(HarvesterBase):
@@ -221,18 +211,26 @@ class BioSchemaMUHarvester(HarvesterBase):
 
             # creating package
             log.debug("Create/update package using dict: %s" % package_dict)
-            self._create_or_update_package(
+            transaction = Session.begin_nested()
+            package_result = self._create_or_update_package(
                 package_dict, harvest_object, "package_show"
             )
-
+            if not package_result:
+                raise RuntimeError("CKAN package create/update failed")
+            synchronize_harvested_package(
+                package_dict, harvest_object,
+                names=content.get('alternateName'),
+                name_source="BioSchemas",
+            )
             rebuild(package_dict["name"])
+            if transaction.is_active:
+                transaction.commit()
             Session.commit()
-
-            self._send_to_db(package=package_dict,content=content)
 
             log.debug("Finished record")
 
         except Exception as e:
+            Session.rollback()
             log.exception(e)
             self._save_object_error(
                 "Exception in fetch stage for %s: %r / %s"
@@ -438,73 +436,3 @@ class BioSchemaMUHarvester(HarvesterBase):
                 package_license = license_name['id']
 
         return package_license
-
-    ''' To send data to database (all info) '''
-    def _send_to_db(self,package,content):
-
-        name_list = []
-        package_id = package['id']
-
-        content_hasBioPart = content['hasBioChemEntityPart'][0]
-
-        standard_inchi = content_hasBioPart['inChI']
-
-        inchi_key = content_hasBioPart['inChIKey']
-        smiles = content_hasBioPart['smiles']
-        exact_mass = content_hasBioPart['monoisotopicMolecularWeight']
-        mol_formula = content_hasBioPart['molecularFormula']
-
-        # To harvest alternate Names and define them to list such that they can be dumped to database
-        alternatenames = content['alternateName']
-
-        if isinstance(alternatenames,list) is True:
-            for p in alternatenames:
-                name = [package_id,p]
-                name_list.append(name)
-        else:
-            name_list.append([package_id,alternatenames])
-
-        # connect to db
-        con = psycopg2.connect(user=DB_USER,
-                               host=DB_HOST,
-                               password=DB_pwd,
-                               dbname=DB_NAME)
-
-        con.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-
-        values = [json.dumps(standard_inchi), smiles, inchi_key, exact_mass,mol_formula]
-
-        # Cursor
-        cur = con.cursor()
-        cur2 = con.cursor()
-
-        # Check if the row already exists, if not then INSERT
-
-        cur.execute("SELECT id FROM molecules WHERE inchi_key = %s", (inchi_key,))
-        if cur.fetchone() is None:
-            cur.execute("INSERT INTO molecules VALUES (nextval('molecule_data_id_seq'),%s,%s,%s,%s,%s)", values)
-            new_molecule_id = cur.fetchone()[0]
-            cur2.execute("INSERT INTO molecule_rel_data (molecule_id, package_id) VALUES (%s, %s)",
-                         (new_molecule_id, package_id))
-
-        cur3 = con.cursor()
-
-        for name in name_list:
-            cur3.execute("SELECT * FROM related_resources WHERE package_id = %s AND alternate_name = %s;", name)
-            #log.debug(f'db to {name}')
-            if cur3.fetchone() is None:
-                cur3.execute("INSERT INTO related_resources(id,package_id,alternate_name) VALUES(nextval('related_resources_id_seq'),%s,%s)", name)
-
-        # commit cursor
-        con.commit()
-        # close cursor
-        cur.close()
-        # close connection
-        con.close()
-        log.debug('data sent to db')
-        return 0
-
-
-
-
-
