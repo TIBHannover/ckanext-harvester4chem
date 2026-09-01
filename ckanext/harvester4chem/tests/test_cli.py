@@ -1,8 +1,10 @@
 import pytest
 from click.testing import CliRunner
+import copy
 
 from ckanext.harvester4chem import cli
 from ckanext.harvester4chem.cli import VERIFY_SQL
+from ckanext.harvester4chem import molecule_sync
 
 
 LEGACY_DATASET_AUDIT = "legacy_dataset_chemistry_missing_molecule_package"
@@ -196,3 +198,223 @@ def test_dataset_extra_audit_matches_and_reports_missing_pairs_separately():
     ]
     molecule_extras = [("molecule-1", True, "KEY-A", True)]
     assert _missing_pairs(dataset_extras, molecule_extras) == 1
+
+
+class BackfillResult(object):
+    def __init__(self, rows=None):
+        self.rows = rows or []
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return self.rows
+
+
+class BackfillSession(object):
+    def __init__(self, packages=None):
+        self.packages = packages or {}
+        self.rows = []
+        self.sql = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.snapshot = None
+
+    def execute(self, statement, params=None):
+        sql, params = " ".join(str(statement).split()), params or {}
+        self.sql.append((sql, copy.deepcopy(params)))
+        if sql.startswith("LOCK TABLE"):
+            self.snapshot = copy.deepcopy(self.rows)
+            return BackfillResult()
+        if sql.startswith("SELECT id, name, title, type, state"):
+            package = self.packages.get(params["name"])
+            return BackfillResult([(
+                package["id"], package["name"], package.get("title"),
+                package["type"], package["state"]
+            )] if package else [])
+        if sql.startswith("SELECT key, value, state"):
+            package = next(item for item in self.packages.values()
+                           if item["id"] == params["package_id"])
+            return BackfillResult([
+                (item["key"], item["value"], item.get("state", "active"))
+                for item in package.get("extras", [])
+                if item.get("state", "active") == "active"
+            ])
+        raise AssertionError(sql)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+        if self.snapshot is not None:
+            self.rows = copy.deepcopy(self.snapshot)
+
+
+def package(name, state="active", package_type="molecule", smiles="CCO",
+            key="LFQSCWFLJHTTHZ-UHFFFAOYSA-N"):
+    extras = [{"key": "inchi_key", "value": key, "state": "active"}]
+    if smiles is not None:
+        extras.append({"key": "smiles", "value": smiles, "state": "active"})
+    return {"id": "id-" + name, "name": name, "title": "Ethanol",
+            "type": package_type, "state": state, "extras": extras}
+
+
+def test_manifest_parsing_ignores_blank_and_comment_lines(tmp_path):
+    manifest = tmp_path / "manifest.txt"
+    manifest.write_text("\n# production batch\n mol-one \n\n mol-two\n")
+    assert cli.parse_repair_manifest(str(manifest)) == ["mol-one", "mol-two"]
+
+
+def test_manifest_rejects_duplicate_names(tmp_path):
+    manifest = tmp_path / "manifest.txt"
+    manifest.write_text("mol-one\nmol-one\n")
+    with pytest.raises(Exception, match="duplicate manifest entry"):
+        cli.parse_repair_manifest(str(manifest))
+
+
+@pytest.mark.parametrize("args", [[], ["--dry-run", "--apply"]])
+def test_repair_requires_exactly_one_mode(tmp_path, args):
+    manifest = tmp_path / "manifest.txt"
+    manifest.write_text("mol-one\n")
+    result = CliRunner().invoke(
+        cli.harvester4chem,
+        ["repair-missing-rdk", "--manifest", str(manifest)] + args)
+    assert result.exit_code != 0
+    assert "exactly one" in result.output
+
+
+@pytest.mark.parametrize("item, reason", [
+    (package("inactive", state="deleted"), "not active"),
+    (package("dataset", package_type="dataset"), "not molecule"),
+    (package("no-structure", smiles=None), "missing InChI/SMILES"),
+    (package("bad-key", key="AAAAAAAAAAAAAA-BBBBBBBBBB-C"), "mismatch"),
+])
+def test_backfill_package_metadata_rejections(item, reason):
+    class NoSql(object):
+        def execute(self, statement, params=None):
+            raise AssertionError("validation should fail before PostgreSQL SQL")
+    with pytest.raises(molecule_sync.MoleculeSyncError, match=reason):
+        molecule_sync.validate_rdk_backfill_package(item, NoSql())
+
+
+def test_existing_rdkit_molecule_is_rejected():
+    class Existing(object):
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            if sql.startswith("SELECT mol_from_smiles"):
+                return BackfillResult([(True, True, True)])
+            if sql.startswith("SELECT molecule_id"):
+                values = molecule_sync.normalize_structure(smiles="CCO")
+                return BackfillResult([(7, values["inchi_key"],
+                                         values["inchi_code"])])
+            raise AssertionError(sql)
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="already present"):
+        molecule_sync.validate_rdk_backfill_package(package("existing"), Existing())
+
+
+def _mock_batch(monkeypatch, count=28, fail_at=None):
+    packages = {"mol-{0}".format(i): package("mol-{0}".format(i))
+                for i in range(count)}
+    session = BackfillSession(packages)
+
+    def validate(item, current_session):
+        return item
+
+    def create(item, current_session):
+        index = int(item["name"].split("-")[-1])
+        if index == fail_at:
+            raise molecule_sync.MoleculeSyncError("fingerprint insert failed")
+        current_session.rows.append(item["name"])
+        return 100 + index
+
+    monkeypatch.setattr(cli, "validate_rdk_backfill_package", validate)
+    monkeypatch.setattr(cli, "create_validated_rdk_backfill", create)
+    return list(packages), session
+
+
+def test_successful_28_style_apply_is_one_transaction(monkeypatch):
+    names, session = _mock_batch(monkeypatch)
+    results, summary = cli.repair_missing_rdk(names, "apply", session)
+    assert len(results) == 28
+    assert summary == {"mode": "apply", "requested": 28, "validated": 28,
+                       "created": 28, "failed": 0, "rolled_back": False}
+    assert session.commits == 1 and session.rollbacks == 0
+    assert len(session.rows) == 28
+
+
+def test_dry_run_executes_inserts_then_rolls_back(monkeypatch):
+    names, session = _mock_batch(monkeypatch, count=2)
+    _, summary = cli.repair_missing_rdk(names, "dry-run", session)
+    assert summary["created"] == 2 and summary["rolled_back"] is True
+    assert session.rows == []
+    assert session.commits == 0 and session.rollbacks == 1
+
+
+def test_final_insert_failure_rolls_back_complete_batch(monkeypatch):
+    names, session = _mock_batch(monkeypatch, count=3, fail_at=2)
+    results, summary = cli.repair_missing_rdk(names, "apply", session)
+    assert results[-1]["reason"] == "fingerprint insert failed"
+    assert results[0]["status"] == "rolled_back"
+    assert summary["created"] == 0 and summary["rolled_back"] is True
+    assert session.rows == [] and session.commits == 0
+
+
+def test_preflight_failure_writes_nothing(monkeypatch):
+    names, session = _mock_batch(monkeypatch, count=3)
+    original = cli.validate_rdk_backfill_package
+
+    def fail_final(item, current_session):
+        if item["name"] == "mol-2":
+            raise molecule_sync.MoleculeSyncError("InChIKey mismatch")
+        return original(item, current_session)
+
+    monkeypatch.setattr(cli, "validate_rdk_backfill_package", fail_final)
+    _, summary = cli.repair_missing_rdk(names, "apply", session)
+    assert summary["created"] == 0 and summary["failed"] == 1
+    assert session.rows == [] and session.commits == 0
+
+
+def test_idempotent_second_run_reports_already_present(monkeypatch):
+    names, session = _mock_batch(monkeypatch, count=1)
+
+    def validate(item, current_session):
+        if item["name"] in current_session.rows:
+            raise molecule_sync.MoleculeSyncError(
+                "already present in rdk.molecules")
+        return item
+
+    monkeypatch.setattr(cli, "validate_rdk_backfill_package", validate)
+    _, first = cli.repair_missing_rdk(names, "apply", session)
+    results, second = cli.repair_missing_rdk(names, "dry-run", session)
+    assert first["created"] == 1
+    assert results[0]["reason"] == "already present in rdk.molecules"
+    assert second["created"] == 0 and second["failed"] == 1
+    assert session.rows == names
+
+
+def test_backfill_path_has_no_legacy_or_ckan_action_writes(monkeypatch):
+    names, session = _mock_batch(monkeypatch, count=1)
+    monkeypatch.setattr(cli.toolkit, "get_action",
+                        lambda name: pytest.fail("CKAN action called: " + name))
+    cli.repair_missing_rdk(names, "dry-run", session)
+    sql = " ".join(item[0].lower() for item in session.sql)
+    assert "public.molecules" not in sql
+    assert "molecule_rel_data" not in sql
+    assert "relationship_relationship" not in sql
+
+
+def test_all_technical_alternate_names_are_filtered():
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    item = package("nfdi4chem-mol1067")
+    item["title"] = "nfdi4chem-mol1067"
+    item["extras"].append({"key": "alternate_name",
+                           "value": '["nfdi4chem-mol1067", "Ethanol"]',
+                           "state": "active"})
+    assert molecule_sync._rdk_names(item, values) == ["Ethanol"]
+
+
+def test_insert_only_sql_cannot_update_existing_rdk_molecule():
+    source = open(molecule_sync.__file__, "r").read()
+    assert 'conflict = "DO NOTHING" if insert_only' in source
+    assert "commit(" not in source

@@ -6,7 +6,10 @@ from sqlalchemy import text
 import ckan.model as model
 import ckan.plugins.toolkit as toolkit
 
-from ckanext.harvester4chem.molecule_sync import synchronize_molecule
+from ckanext.harvester4chem.molecule_sync import (
+    MoleculeSyncError, create_validated_rdk_backfill, normalize_chemical_text,
+    synchronize_molecule, validate_rdk_backfill_package,
+)
 
 
 VERIFY_SQL = {
@@ -169,6 +172,97 @@ def _package_value(package, key):
     return None
 
 
+def parse_repair_manifest(filename):
+    """Read an explicit package-name manifest and reject duplicates."""
+    names, seen = [], set()
+    with open(filename, "r") as manifest:
+        for line_number, line in enumerate(manifest, 1):
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            if name in seen:
+                raise click.ClickException(
+                    "duplicate manifest entry {0} on line {1}".format(
+                        name, line_number))
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _load_manifest_package(session, package_name):
+    row = session.execute(text("""
+        SELECT id, name, title, type, state FROM public.package
+        WHERE name=:name LIMIT 1
+    """), {"name": package_name}).fetchone()
+    if not row:
+        raise MoleculeSyncError("package does not exist")
+    package = {"id": row[0], "name": row[1], "title": row[2],
+               "type": row[3], "state": row[4], "extras": []}
+    extras = session.execute(text("""
+        SELECT key, value, state FROM public.package_extra
+        WHERE package_id=:package_id AND state='active' ORDER BY id
+    """), {"package_id": row[0]}).fetchall()
+    package["extras"] = [
+        {"key": item[0], "value": normalize_chemical_text(item[1]),
+         "state": item[2]} for item in extras
+    ]
+    return package
+
+
+def repair_missing_rdk(names, mode, session=None):
+    """Validate a complete explicit batch, then atomically insert rdk.* only."""
+    session = session or model.Session
+    results, validated = [], []
+    try:
+        # Prevent another conforming writer from racing between preflight and insert.
+        session.execute(text(
+            "LOCK TABLE rdk.molecules IN SHARE ROW EXCLUSIVE MODE"))
+        for name in names:
+            try:
+                package = _load_manifest_package(session, name)
+                validated.append(validate_rdk_backfill_package(package, session))
+                results.append({"package": name, "status": "validated"})
+            except Exception as error:
+                results.append({"package": name, "status": "failed",
+                                "reason": str(error)})
+        if len(validated) != len(names):
+            raise MoleculeSyncError("manifest preflight failed")
+        for package, result in zip(validated, results):
+            try:
+                result["rdk_molecule_id"] = create_validated_rdk_backfill(
+                    package, session)
+                result["status"] = "created"
+            except Exception as error:
+                result["status"] = "failed"
+                result["reason"] = str(error)
+                raise
+        summary = {"mode": mode, "requested": len(names),
+                   "validated": len(validated), "created": len(validated),
+                   "failed": 0, "rolled_back": mode == "dry-run"}
+        if mode == "dry-run":
+            session.rollback()
+        else:
+            session.commit()
+        return results, summary
+    except Exception as error:
+        session.rollback()
+        if len(validated) != len(names):
+            summary = {"mode": mode, "requested": len(names),
+                       "validated": len(validated), "created": 0,
+                       "failed": len(names) - len(validated),
+                       "rolled_back": True}
+            return results, summary
+        if validated:
+            for result in results:
+                if result.get("status") == "created":
+                    result["status"] = "rolled_back"
+            summary = {"mode": mode, "requested": len(names),
+                       "validated": len(validated), "created": 0,
+                       "failed": 1, "rolled_back": True}
+            return results, summary
+        raise error
+
+
 @click.group(name="harvester4chem")
 def harvester4chem():
     """Safely synchronize harvested chemistry with PostgreSQL RDKit."""
@@ -214,6 +308,27 @@ def sync_package_command(package_id, dry_run, write_legacy):
     )
     model.Session.rollback()
     click.echo(json.dumps(result, sort_keys=True))
+
+
+@harvester4chem.command(name="repair-missing-rdk")
+@click.option("--manifest", type=click.Path(exists=True, dir_okay=False),
+              required=True)
+@click.option("--dry-run", is_flag=True)
+@click.option("--apply", "apply_mode", is_flag=True)
+def repair_missing_rdk_command(manifest, dry_run, apply_mode):
+    """Backfill explicitly listed molecule packages into rdk.* only."""
+    if dry_run == apply_mode:
+        raise click.UsageError("exactly one of --dry-run or --apply is required")
+    mode = "dry-run" if dry_run else "apply"
+    names = parse_repair_manifest(manifest)
+    if not names:
+        raise click.ClickException("manifest contains no package names")
+    results, summary = repair_missing_rdk(names, mode)
+    for result in results:
+        click.echo(json.dumps(result, sort_keys=True))
+    click.echo(json.dumps(summary, sort_keys=True))
+    if summary["failed"]:
+        raise click.ClickException("manifest preflight failed; no rows written")
 
 
 def get_commands():

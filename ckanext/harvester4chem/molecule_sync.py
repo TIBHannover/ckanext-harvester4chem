@@ -84,6 +84,12 @@ def _chemical_display_name(value, inchi_key):
     return value
 
 
+def normalized_inchi_key(value):
+    """Return CKAN's normalized InChIKey representation."""
+    value = normalize_chemical_text(value)
+    return value.upper() if value else None
+
+
 def normalize_structure(inchi_code=None, inchi_key=None, smiles=None,
                         mol_formula=None, exact_mass=None):
     inchi_code = normalize_chemical_text(inchi_code)
@@ -264,26 +270,43 @@ def ensure_molecule_package(values, names=None, session=None,
     return package, [], True
 
 
+def _rdk_names(package, values):
+    alternate = _package_value(package, "alternate_name")
+    try:
+        alternate = json.loads(alternate) if isinstance(alternate, str) else alternate
+    except (TypeError, ValueError):
+        pass
+    candidates = [package.get("title")] + clean_names(alternate)
+    return clean_names([
+        _chemical_display_name(name, values["inchi_key"])
+        for name in candidates
+    ])
+
+
 def synchronize_molecule_package_with_rdk(package, session=None,
-                                          name_source="CKAN"):
+                                          name_source="CKAN",
+                                          insert_only=False):
     """Upsert rdk.* from a type=molecule package and return its RDKit ID."""
     if package.get("type") != "molecule" or package.get("state", "active") != "active":
         raise MoleculeSyncError("RDKit source must be an active molecule package")
     session, values = session or model.Session, _package_values(package)
+    conflict = "DO NOTHING" if insert_only else """DO UPDATE SET
+          molecule=EXCLUDED.molecule, canonical_smiles=EXCLUDED.canonical_smiles,
+          inchi_key=EXCLUDED.inchi_key,
+          mol_formula=COALESCE(EXCLUDED.mol_formula,rdk.molecules.mol_formula),
+          exact_mass=COALESCE(EXCLUDED.exact_mass,rdk.molecules.exact_mass)"""
     row = _one(session, """
         INSERT INTO rdk.molecules
           (molecule, canonical_smiles, inchi_key, inchi_code, mol_formula, exact_mass)
         VALUES (mol_from_smiles(CAST(:canonical_smiles AS cstring)),
                 :canonical_smiles, :inchi_key, :inchi_code, :mol_formula, :exact_mass)
-        ON CONFLICT (inchi_code) DO UPDATE SET
-          molecule=EXCLUDED.molecule, canonical_smiles=EXCLUDED.canonical_smiles,
-          inchi_key=EXCLUDED.inchi_key,
-          mol_formula=COALESCE(EXCLUDED.mol_formula,rdk.molecules.mol_formula),
-          exact_mass=COALESCE(EXCLUDED.exact_mass,rdk.molecules.exact_mass)
+        ON CONFLICT (inchi_code) {0}
         RETURNING molecule_id
-    """, values)
+    """.format(conflict), values)
     if not row:
-        raise MoleculeSyncError("RDKit molecule upsert returned no row")
+        raise MoleculeSyncError(
+            "RDKit molecule already present (concurrent insert)" if insert_only
+            else "RDKit molecule upsert returned no row")
     molecule_id = row[0]
     if not _one(session, """
         INSERT INTO rdk.fingerprints (molecule_id,mfp2,ffp2)
@@ -293,14 +316,7 @@ def synchronize_molecule_package_with_rdk(package, session=None,
         RETURNING molecule_id
     """, {"molecule_id": molecule_id}):
         raise MoleculeSyncError("fingerprint upsert returned no row")
-    alternate = _package_value(package, "alternate_name")
-    try:
-        alternate = json.loads(alternate) if isinstance(alternate, str) else alternate
-    except (TypeError, ValueError):
-        pass
-    title = _chemical_display_name(package.get("title"), values["inchi_key"])
-    names = clean_names([title] + clean_names(alternate))
-    for name in names:
+    for name in _rdk_names(package, values):
         params = {"molecule_id": molecule_id, "name": name,
                   "source": clean_value(name_source) or "CKAN"}
         if not _one(session, """
@@ -312,6 +328,61 @@ def synchronize_molecule_package_with_rdk(package, session=None,
                 VALUES (:molecule_id,:name,'harvested_name',:source)
             """), params)
     return molecule_id
+
+
+def validate_rdk_backfill_package(package, session=None):
+    """Validate one existing package without changing any database row."""
+    session = session or model.Session
+    name = clean_value(package.get("name")) or clean_value(package.get("id"))
+    if package.get("state") != "active":
+        raise MoleculeSyncError("package is not active")
+    if package.get("type") != MOLECULE_PACKAGE_TYPE:
+        raise MoleculeSyncError("package type is not molecule")
+    supplied_key = normalized_inchi_key(_package_value(package, "inchi_key"))
+    if not supplied_key:
+        raise MoleculeSyncError("missing InChIKey")
+    if not (_package_value(package, "inchi") or
+            _package_value(package, "canonical_smiles") or
+            _package_value(package, "smiles")):
+        raise MoleculeSyncError("missing InChI/SMILES")
+    values = _package_values(package)
+    # normalize_structure performs the mandatory supplied/calculated key check.
+    parsed = _one(session, """
+        SELECT mol_from_smiles(CAST(:canonical_smiles AS cstring)) IS NOT NULL,
+               morganbv_fp(mol_from_smiles(CAST(:canonical_smiles AS cstring)))
+                 IS NOT NULL,
+               featmorganbv_fp(mol_from_smiles(CAST(:canonical_smiles AS cstring)))
+                 IS NOT NULL
+    """, values)
+    if not parsed or not parsed[0]:
+        raise MoleculeSyncError("PostgreSQL RDKit cannot parse structure")
+    if not parsed[1] or not parsed[2]:
+        raise MoleculeSyncError("PostgreSQL RDKit cannot generate fingerprint")
+    rows = session.execute(text("""
+        SELECT molecule_id, inchi_key, inchi_code
+        FROM rdk.molecules
+        WHERE upper(btrim(inchi_key))=:inchi_key OR inchi_code=:inchi_code
+        ORDER BY molecule_id
+    """), values).fetchall()
+    if rows:
+        exact = [row for row in rows
+                 if normalized_inchi_key(row[1]) == values["inchi_key"] and
+                 normalize_chemical_text(row[2]) == values["inchi_code"]]
+        if exact:
+            raise MoleculeSyncError("already present in rdk.molecules")
+        raise MoleculeSyncError(
+            "conflicting rdk.molecules row by InChIKey or validated InChI")
+    result = dict(package)
+    result["_rdk_values"] = values
+    result["_backfill_name"] = name
+    return result
+
+
+def create_validated_rdk_backfill(package, session=None):
+    """Insert only rdk.* data for a package previously validated above."""
+    session = session or model.Session
+    return synchronize_molecule_package_with_rdk(
+        package, session=session, name_source="CKAN", insert_only=True)
 
 
 def ensure_dataset_molecule_package_relationship(dataset_id, molecule_id,
