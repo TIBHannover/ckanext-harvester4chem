@@ -113,10 +113,11 @@ Legacy compatibility writes are disabled by default:
 
     ckan.harvester4chem.write_legacy = false
 
-This setting controls only synchronization performed by
-`ckanext-harvester4chem`. Existing rows in `public.molecules` and
-`public.molecule_rel_data` are retained, and other extensions may continue to
-use those tables. Disabling the option does not drop or migrate any data.
+This setting controls synchronization performed by `ckanext-harvester4chem`
+and the MassBank datapackager creation path. Existing rows in
+`public.molecules` and `public.molecule_rel_data` are retained, and other
+extensions may continue to use those tables. Disabling the option does not
+drop or migrate any data.
 
 The `harvester4chem sync-package --dry-run` command uses this configured value.
 Its `--write-legacy` and `--no-write-legacy` flags are diagnostic overrides;
