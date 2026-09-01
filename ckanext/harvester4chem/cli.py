@@ -1,3 +1,4 @@
+import csv
 import json
 
 import click
@@ -7,8 +8,11 @@ import ckan.model as model
 import ckan.plugins.toolkit as toolkit
 
 from ckanext.harvester4chem.molecule_sync import (
-    MoleculeSyncError, create_validated_rdk_backfill, normalize_chemical_text,
-    synchronize_molecule, validate_rdk_backfill_package,
+    MoleculeSyncError, TECHNICAL_MOLECULE_NAME,
+    create_validated_rdk_backfill, normalize_chemical_text,
+    normalize_inchi_structure, normalize_smiles_structure,
+    normalized_inchi_key, synchronize_molecule,
+    validate_rdk_backfill_package,
 )
 
 
@@ -263,6 +267,255 @@ def repair_missing_rdk(names, mode, session=None):
         raise error
 
 
+DUPLICATE_GROUPS_SQL = text("""
+    SELECT upper(trim(both '"' from btrim(e.value))) AS inchi_key,
+           array_agg(DISTINCT p.id ORDER BY p.id) AS package_ids
+    FROM public.package p
+    JOIN public.package_extra e ON e.package_id=p.id
+      AND e.key='inchi_key' AND e.state='active'
+      AND e.value IS NOT NULL AND btrim(e.value)<>''
+    WHERE p.type='molecule' AND p.state='active'
+    GROUP BY upper(trim(both '"' from btrim(e.value)))
+    HAVING count(DISTINCT p.id)=2
+    ORDER BY inchi_key
+""")
+
+
+def _load_dedup_package(session, package_id):
+    row = session.execute(text("""
+        SELECT id,name,title,type,state,metadata_created
+        FROM public.package WHERE id=:package_id
+    """), {"package_id": package_id}).fetchone()
+    if not row:
+        raise MoleculeSyncError("duplicate package disappeared during audit")
+    package = {"id": row[0], "name": row[1], "title": row[2],
+               "type": row[3], "state": row[4],
+               "metadata_created": row[5], "extras": []}
+    package["extras"] = [
+        {"key": item[0], "value": normalize_chemical_text(item[1]),
+         "state": item[2]}
+        for item in session.execute(text("""
+            SELECT key,value,state FROM public.package_extra
+            WHERE package_id=:package_id AND state='active' ORDER BY id
+        """), {"package_id": package_id}).fetchall()
+    ]
+    package["active_dataset_relationships"] = session.execute(text("""
+        SELECT count(*) FROM public.package_relationship r
+        JOIN public.package other ON
+          (r.subject_package_id=:package_id AND other.id=r.object_package_id)
+          OR (r.object_package_id=:package_id AND other.id=r.subject_package_id)
+        WHERE r.state='active' AND other.state='active'
+          AND other.type<>'molecule'
+    """), {"package_id": package_id}).scalar()
+    return package
+
+
+def _is_meaningful_title(package, inchi_key):
+    title = normalize_chemical_text(package.get("title"))
+    return bool(title and title.upper() != inchi_key and
+                not TECHNICAL_MOLECULE_NAME.match(title))
+
+
+def _is_valid(package, key, inchi_key):
+    try:
+        if key == "inchi":
+            normalize_inchi_structure(_package_value(package, key), inchi_key)
+        else:
+            normalize_smiles_structure(
+                _package_value(package, "canonical_smiles") or
+                _package_value(package, "smiles"), inchi_key)
+        return True
+    except MoleculeSyncError:
+        return False
+
+
+def _canonical_rank(package, inchi_key):
+    completeness = sum(
+        1 for extra in package.get("extras", [])
+        if normalize_chemical_text(extra.get("value")) is not None)
+    formula = (_package_value(package, "mol_formula") or
+               _package_value(package, "molecular_formula"))
+    created = package.get("metadata_created")
+    return (-int(package.get("active_dataset_relationships") or 0),
+            -int(_is_meaningful_title(package, inchi_key)),
+            -int(_is_valid(package, "inchi", inchi_key)),
+            -int(_is_valid(package, "smiles", inchi_key)),
+            -int(bool(normalize_chemical_text(formula))), -completeness,
+            created is None, created or "", package["name"])
+
+
+def _package_references(session, package):
+    params = {"package_id": package["id"]}
+    incoming = session.execute(text("""
+        SELECT count(*) FROM public.package_relationship
+        WHERE object_package_id=:package_id
+    """), params).scalar()
+    outgoing = session.execute(text("""
+        SELECT count(*) FROM public.package_relationship
+        WHERE subject_package_id=:package_id
+    """), params).scalar()
+    legacy = session.execute(text("""
+        SELECT count(*) FROM public.molecule_rel_data
+        WHERE package_id=:package_id
+    """), params).scalar()
+    return {"incoming": int(incoming or 0), "outgoing": int(outgoing or 0),
+            "legacy": int(legacy or 0)}
+
+
+def _metadata_plan(keep, remove, expected_key):
+    protected = {"inchi", "inchi_key", "smiles", "canonical_smiles"}
+    keep_values = {item["key"]: normalize_chemical_text(item.get("value"))
+                   for item in keep.get("extras", [])}
+    remove_values = {item["key"]: normalize_chemical_text(item.get("value"))
+                     for item in remove.get("extras", [])}
+    plan = {"retained": [], "copied": [], "identical": [], "conflicts": []}
+    for key in sorted(set(keep_values) | set(remove_values)):
+        left, right = keep_values.get(key), remove_values.get(key)
+        if left and right and left == right:
+            plan["identical"].append(key)
+        elif left and not right:
+            plan["retained"].append(key)
+        elif right and not left:
+            plan["copied"].append(key)
+        elif left != right:
+            plan["conflicts"].append(
+                {"field": key, "keep": left, "remove": right,
+                 "protected_structure": key in protected})
+    remove_title = normalize_chemical_text(remove.get("title"))
+    keep_title = normalize_chemical_text(keep.get("title"))
+    synonym = (remove_title if remove_title and
+               remove_title.casefold() != (keep_title or "").casefold() and
+               remove_title.upper() != expected_key and
+               not TECHNICAL_MOLECULE_NAME.match(remove_title) else None)
+    plan["planned_synonym"] = synonym
+    return plan
+
+
+def validate_duplicate_pair(session, inchi_key, packages):
+    """Return a complete read-only plan or a blocked-pair reason."""
+    expected = normalized_inchi_key(inchi_key)
+    if len(packages) != 2:
+        raise MoleculeSyncError("duplicate group does not contain exactly two packages")
+    if any(item["name"] == "nfdi4chem-mol9372" for item in packages):
+        raise MoleculeSyncError("nfdi4chem-mol9372 is explicitly excluded")
+    ordered = sorted(packages, key=lambda item: _canonical_rank(item, expected))
+    keep, remove = ordered[0], ordered[1]
+    references = {item["name"]: _package_references(session, item)
+                  for item in packages}
+    if any(sum(item.values()) for item in references.values()):
+        raise MoleculeSyncError("package reference blocks cleanup: {0}".format(
+            json.dumps(references, sort_keys=True)))
+    inchi_values, smiles_values = [], []
+    for package in packages:
+        inchi_values.append(normalize_inchi_structure(
+            _package_value(package, "inchi"), expected))
+        smiles_values.append(normalize_smiles_structure(
+            _package_value(package, "canonical_smiles") or
+            _package_value(package, "smiles"), expected))
+    if any(item["inchi_key"] != expected for item in inchi_values + smiles_values):
+        raise MoleculeSyncError("generated InChIKey does not match CKAN InChIKey")
+    calculated_formula = inchi_values[0]["calculated_formula"]
+    formulas, missing = [], []
+    for package, values in zip(packages, inchi_values):
+        formula = normalize_chemical_text(
+            _package_value(package, "mol_formula") or
+            _package_value(package, "molecular_formula"))
+        if formula is None:
+            missing.append(package["name"])
+        elif formula != values["calculated_formula"]:
+            raise MoleculeSyncError(
+                "conflicting molecular formula for {0}: supplied {1}, calculated {2}"
+                .format(package["name"], formula, values["calculated_formula"]))
+        formulas.append(formula)
+    rdk_rows = session.execute(text("""
+        SELECT m.molecule_id, f.molecule_id IS NOT NULL,
+               f.mfp2 IS NOT NULL, f.ffp2 IS NOT NULL
+        FROM rdk.molecules m LEFT JOIN rdk.fingerprints f
+          ON f.molecule_id=m.molecule_id
+        WHERE upper(btrim(m.inchi_key))=:inchi_key
+    """), {"inchi_key": expected}).fetchall()
+    if len(rdk_rows) != 1:
+        raise MoleculeSyncError(
+            "expected exactly one matching rdk.molecules row; found {0}"
+            .format(len(rdk_rows)))
+    if not all(rdk_rows[0][1:]):
+        raise MoleculeSyncError("matching RDKit fingerprint is missing or null")
+    raw_smiles = [normalize_chemical_text(
+        _package_value(item, "canonical_smiles") or _package_value(item, "smiles"))
+        for item in packages]
+    titles = [normalize_chemical_text(item.get("title")) for item in packages]
+    return {"inchi_key": expected, "keep_package": keep["name"],
+            "remove_package": remove["name"], "references": references,
+            "metadata_plan": _metadata_plan(keep, remove, expected),
+            "differing_titles": titles[0] != titles[1],
+            "equivalent_differing_smiles": raw_smiles[0] != raw_smiles[1],
+            "missing_formulas": missing, "calculated_formula": calculated_formula,
+            "relationships_requiring_migration": 0}
+
+
+def _write_dedup_manifest(filename, plans):
+    with open(filename, "w", newline="") as manifest:
+        writer = csv.DictWriter(
+            manifest,
+            fieldnames=["inchi_key", "keep_package", "remove_package"])
+        writer.writeheader()
+        for plan in plans:
+            writer.writerow({key: plan[key] for key in writer.fieldnames})
+
+
+def deduplicate_molecule_packages_dry_run(session, manifest_out):
+    plans, blocked = [], []
+    try:
+        groups = session.execute(DUPLICATE_GROUPS_SQL).fetchall()
+        for inchi_key, package_ids in groups:
+            packages = [_load_dedup_package(session, item)
+                        for item in package_ids]
+            try:
+                plans.append(validate_duplicate_pair(
+                    session, inchi_key, packages))
+            except Exception as error:
+                references = {item["name"]: _package_references(session, item)
+                              for item in packages}
+                blocked.append({"inchi_key": normalized_inchi_key(inchi_key),
+                                "packages": [item["name"] for item in packages],
+                                "references": references,
+                                "reason": str(error)})
+        active_count = session.execute(text("""
+            SELECT count(*) FROM public.package
+            WHERE type='molecule' AND state='active'
+        """)).scalar()
+        rdk_count = session.execute(text(
+            "SELECT count(*) FROM rdk.molecules")).scalar()
+        fingerprint_count = session.execute(text(
+            "SELECT count(*) FROM rdk.fingerprints")).scalar()
+        _write_dedup_manifest(manifest_out, plans)
+        summary = {
+            "duplicate_groups_found": len(groups),
+            "validated_pairs": len(plans), "blocked_pairs": len(blocked),
+            "differing_titles": sum(int(x["differing_titles"]) for x in plans),
+            "equivalent_differing_smiles": sum(
+                int(x["equivalent_differing_smiles"]) for x in plans),
+            "missing_formulas": sum(len(x["missing_formulas"]) for x in plans),
+            "conflicting_formulas": sum(
+                int("conflicting molecular formula" in x["reason"])
+                for x in blocked),
+            "packages_to_retain": len(plans),
+            "packages_to_soft_delete": len(plans),
+            "relationships_requiring_migration": sum(
+                x["relationships_requiring_migration"] for x in plans) + sum(
+                    sum(sum(counts.values())
+                        for counts in item["references"].values())
+                    for item in blocked),
+            "expected_active_molecule_packages": int(active_count) - len(plans),
+            "expected_rdk_molecules": int(rdk_count),
+            "expected_rdk_fingerprints": int(fingerprint_count),
+            "database_changed": False,
+        }
+        return plans, blocked, summary
+    finally:
+        session.rollback()
+
+
 @click.group(name="harvester4chem")
 def harvester4chem():
     """Safely synchronize harvested chemistry with PostgreSQL RDKit."""
@@ -329,6 +582,33 @@ def repair_missing_rdk_command(manifest, dry_run, apply_mode):
     click.echo(json.dumps(summary, sort_keys=True))
     if summary["failed"]:
         raise click.ClickException("manifest preflight failed; no rows written")
+
+
+@harvester4chem.command(name="deduplicate-molecule-packages")
+@click.option("--dry-run", is_flag=True, required=True,
+              help="Audit and write only the CSV plan; never change CKAN.")
+@click.option("--manifest-out", type=click.Path(dir_okay=False), required=True)
+def deduplicate_molecule_packages_command(dry_run, manifest_out):
+    """Plan safe duplicate cleanup without changing the database."""
+    plans, blocked, summary = deduplicate_molecule_packages_dry_run(
+        model.Session, manifest_out)
+    for plan in plans:
+        click.echo(json.dumps({"status": "validated", **plan},
+                              sort_keys=True))
+    for item in blocked:
+        click.echo(json.dumps({"status": "blocked", **item},
+                              sort_keys=True))
+    for key in (
+            "duplicate_groups_found", "validated_pairs", "blocked_pairs",
+            "differing_titles", "equivalent_differing_smiles",
+            "missing_formulas", "conflicting_formulas",
+            "packages_to_retain", "packages_to_soft_delete",
+            "relationships_requiring_migration",
+            "expected_active_molecule_packages", "expected_rdk_molecules",
+            "expected_rdk_fingerprints", "database_changed"):
+        click.echo("{0}={1}".format(key, str(summary[key]).lower()
+                                   if isinstance(summary[key], bool)
+                                   else summary[key]))
 
 
 def get_commands():

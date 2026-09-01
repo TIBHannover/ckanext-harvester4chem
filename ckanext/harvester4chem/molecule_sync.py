@@ -90,6 +90,56 @@ def normalized_inchi_key(value):
     return value.upper() if value else None
 
 
+def _normalized_molecule_values(molecule, mol_formula=None, exact_mass=None):
+    canonical = Chem.MolToSmiles(molecule, canonical=True)
+    normalized_inchi = rd_inchi.MolToInchi(molecule)
+    normalized_key = rd_inchi.InchiToInchiKey(normalized_inchi).upper()
+    exact_mass = clean_value(exact_mass)
+    try:
+        exact_mass = (Descriptors.ExactMolWt(molecule) if exact_mass is None
+                      else float(exact_mass))
+    except (TypeError, ValueError):
+        raise MoleculeSyncError("invalid exact mass")
+    return {"canonical_smiles": canonical, "inchi_code": normalized_inchi,
+            "inchi_key": normalized_key,
+            "calculated_formula": rdMolDescriptors.CalcMolFormula(molecule),
+            "mol_formula": clean_value(mol_formula) or
+            rdMolDescriptors.CalcMolFormula(molecule),
+            "exact_mass": exact_mass}
+
+
+def normalize_inchi_structure(inchi_code, inchi_key=None, mol_formula=None,
+                              exact_mass=None):
+    """Strictly normalize an InChI without falling back to another field."""
+    inchi_code = normalize_chemical_text(inchi_code)
+    molecule = rd_inchi.MolFromInchi(inchi_code) if inchi_code else None
+    if molecule is None:
+        raise MoleculeSyncError("invalid or missing InChI")
+    values = _normalized_molecule_values(molecule, mol_formula, exact_mass)
+    supplied = normalized_inchi_key(inchi_key)
+    if supplied and supplied != values["inchi_key"]:
+        raise MoleculeSyncError(
+            "InChIKey mismatch: supplied {0}, calculated {1}".format(
+                supplied, values["inchi_key"]))
+    return values
+
+
+def normalize_smiles_structure(smiles, inchi_key=None, mol_formula=None,
+                               exact_mass=None):
+    """Strictly normalize SMILES and validate its generated InChIKey."""
+    smiles = normalize_chemical_text(smiles)
+    molecule = Chem.MolFromSmiles(smiles) if smiles else None
+    if molecule is None:
+        raise MoleculeSyncError("invalid or missing SMILES")
+    values = _normalized_molecule_values(molecule, mol_formula, exact_mass)
+    supplied = normalized_inchi_key(inchi_key)
+    if supplied and supplied != values["inchi_key"]:
+        raise MoleculeSyncError(
+            "SMILES generated InChIKey mismatch: supplied {0}, calculated {1}"
+            .format(supplied, values["inchi_key"]))
+    return values
+
+
 def normalize_structure(inchi_code=None, inchi_key=None, smiles=None,
                         mol_formula=None, exact_mass=None):
     inchi_code = normalize_chemical_text(inchi_code)
@@ -106,24 +156,13 @@ def normalize_structure(inchi_code=None, inchi_key=None, smiles=None,
             log.warning("HARVESTER4CHEM could not parse supplied SMILES")
     if molecule is None:
         raise MoleculeSyncError("invalid or missing InChI/SMILES")
-    canonical = Chem.MolToSmiles(molecule, canonical=True)
-    normalized_inchi = rd_inchi.MolToInchi(molecule)
-    normalized_key = rd_inchi.InchiToInchiKey(normalized_inchi).upper()
-    if inchi_key and inchi_key.upper() != normalized_key:
+    values = _normalized_molecule_values(molecule, mol_formula, exact_mass)
+    if inchi_key and inchi_key.upper() != values["inchi_key"]:
         raise MoleculeSyncError(
             "InChIKey mismatch: supplied {0}, calculated {1}".format(
-                inchi_key, normalized_key))
-    exact_mass = clean_value(exact_mass)
-    try:
-        exact_mass = (Descriptors.ExactMolWt(molecule) if exact_mass is None
-                      else float(exact_mass))
-    except (TypeError, ValueError):
-        raise MoleculeSyncError("invalid exact mass")
-    return {"canonical_smiles": canonical, "inchi_code": normalized_inchi,
-            "inchi_key": normalized_key,
-            "mol_formula": clean_value(mol_formula) or
-            rdMolDescriptors.CalcMolFormula(molecule),
-            "exact_mass": exact_mass}
+                inchi_key, values["inchi_key"]))
+    values.pop("calculated_formula")
+    return values
 
 
 def _one(session, sql, params):

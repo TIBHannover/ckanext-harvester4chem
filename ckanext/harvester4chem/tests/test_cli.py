@@ -9,6 +9,7 @@ from ckanext.harvester4chem import molecule_sync
 
 LEGACY_DATASET_AUDIT = "legacy_dataset_chemistry_missing_molecule_package"
 DATASET_EXTRA_AUDIT = "dataset_extra_inchikey_missing_molecule_package"
+ETHANOL_KEY = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
 
 
 def _sql(label):
@@ -209,6 +210,9 @@ class BackfillResult(object):
 
     def fetchall(self):
         return self.rows
+
+    def scalar(self):
+        return self.rows[0][0] if self.rows else None
 
 
 class BackfillSession(object):
@@ -418,3 +422,216 @@ def test_insert_only_sql_cannot_update_existing_rdk_molecule():
     source = open(molecule_sync.__file__, "r").read()
     assert 'conflict = "DO NOTHING" if insert_only' in source
     assert "commit(" not in source
+
+
+def duplicate_package(name, title="Ethanol", smiles="CCO", formula="C2H6O",
+                      created="2020-01-01", extra=None):
+    item = package(name, smiles=smiles)
+    item["title"] = title
+    item["metadata_created"] = created
+    item["active_dataset_relationships"] = 0
+    item["extras"].append({"key": "inchi", "value":
+                           "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3",
+                           "state": "active"})
+    if formula is not None:
+        item["extras"].append({"key": "mol_formula", "value": formula,
+                               "state": "active"})
+    item["extras"].extend(extra or [])
+    return item
+
+
+class PairSession(object):
+    def __init__(self, references=None, rdk_rows=None):
+        self.references = references or {}
+        self.rdk_rows = ([(42, True, True, True)] if rdk_rows is None
+                         else rdk_rows)
+        self.sql = []
+
+    def execute(self, statement, params=None):
+        sql, params = " ".join(str(statement).split()), params or {}
+        self.sql.append(sql)
+        package_id = params.get("package_id")
+        if "object_package_id=:package_id" in sql:
+            return BackfillResult([(self.references.get(
+                (package_id, "incoming"), 0),)])
+        if "subject_package_id=:package_id" in sql:
+            return BackfillResult([(self.references.get(
+                (package_id, "outgoing"), 0),)])
+        if "FROM public.molecule_rel_data" in sql:
+            return BackfillResult([(self.references.get(
+                (package_id, "legacy"), 0),)])
+        if "FROM rdk.molecules m LEFT JOIN rdk.fingerprints" in sql:
+            return BackfillResult(self.rdk_rows)
+        raise AssertionError(sql)
+
+
+def validate_pair(session=None, first=None, second=None):
+    first = first or duplicate_package("nfdi4chem-mol100")
+    second = second or duplicate_package(
+        "nfdi4chem-mol200", created="2021-01-01")
+    return cli.validate_duplicate_pair(
+        session or PairSession(), ETHANOL_KEY, [first, second])
+
+
+def test_identical_duplicate_pair_validates_and_selects_oldest():
+    plan = validate_pair()
+    assert plan["keep_package"] == "nfdi4chem-mol100"
+    assert plan["remove_package"] == "nfdi4chem-mol200"
+    assert plan["equivalent_differing_smiles"] is False
+
+
+def test_duplicate_chemistry_normalizes_json_quotes_and_whitespace():
+    first = duplicate_package("nfdi4chem-mol100")
+    for extra in first["extras"]:
+        if extra["key"] in ("inchi", "inchi_key", "smiles"):
+            extra["value"] = '  "{0}"  '.format(extra["value"])
+    assert validate_pair(first=first)["inchi_key"] == ETHANOL_KEY
+
+
+def test_equivalent_different_smiles_are_allowed():
+    plan = validate_pair(second=duplicate_package(
+        "nfdi4chem-mol200", smiles="OCC", created="2021-01-01"))
+    assert plan["equivalent_differing_smiles"] is True
+
+
+def test_generated_inchi_key_mismatch_blocks_pair():
+    bad = duplicate_package("nfdi4chem-mol200", smiles="CC")
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
+        validate_pair(second=bad)
+
+
+def test_missing_formula_is_planned_for_backfill_and_complete_package_wins():
+    missing = duplicate_package(
+        "nfdi4chem-mol100", formula=None, created="2019-01-01")
+    complete = duplicate_package(
+        "nfdi4chem-mol200", formula="C2H6O", created="2021-01-01")
+    plan = validate_pair(first=missing, second=complete)
+    assert plan["keep_package"] == "nfdi4chem-mol200"
+    assert plan["missing_formulas"] == ["nfdi4chem-mol100"]
+    assert "mol_formula" in plan["metadata_plan"]["retained"]
+
+
+def test_conflicting_nonblank_formula_blocks_pair():
+    bad = duplicate_package("nfdi4chem-mol200", formula="C2H4")
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="conflicting molecular formula"):
+        validate_pair(second=bad)
+
+
+def test_different_genuine_title_becomes_planned_synonym():
+    second = duplicate_package(
+        "nfdi4chem-mol200", title="Ethyl alcohol", created="2021-01-01")
+    plan = validate_pair(second=second)
+    assert plan["differing_titles"] is True
+    assert plan["metadata_plan"]["planned_synonym"] == "Ethyl alcohol"
+
+
+def test_technical_title_is_excluded_as_synonym():
+    second = duplicate_package(
+        "nfdi4chem-mol200 (Unknown Molecule)",
+        title="nfdi4chem-mol200 (Unknown Molecule)", created="2021-01-01")
+    plan = validate_pair(second=second)
+    assert plan["metadata_plan"]["planned_synonym"] is None
+
+
+@pytest.mark.parametrize("direction", ["incoming", "outgoing", "legacy"])
+def test_reference_in_any_direction_blocks_pair(direction):
+    session = PairSession({("id-nfdi4chem-mol200", direction): 1})
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="reference blocks"):
+        validate_pair(session=session)
+
+
+def test_inactive_relationship_still_blocks_cleanup():
+    session = PairSession({("id-nfdi4chem-mol100", "outgoing"): 1})
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="reference blocks"):
+        validate_pair(session=session)
+    relationship_sql = [sql for sql in session.sql
+                        if "package_relationship" in sql]
+    assert all("state='active'" not in sql for sql in relationship_sql)
+
+
+@pytest.mark.parametrize("rows, reason", [
+    ([], "found 0"),
+    ([(1, True, True, True), (2, True, True, True)], "found 2"),
+    ([(1, False, False, False)], "missing or null"),
+    ([(1, True, True, False)], "missing or null"),
+])
+def test_rdkit_identity_and_fingerprint_checks(rows, reason):
+    with pytest.raises(molecule_sync.MoleculeSyncError, match=reason):
+        validate_pair(session=PairSession(rdk_rows=rows))
+
+
+def test_canonical_selection_uses_full_deterministic_priority():
+    first = duplicate_package(
+        "nfdi4chem-mol999", title="nfdi4chem-mol999", created="2010-01-01")
+    second = duplicate_package(
+        "nfdi4chem-mol100", title="Ethanol", created="2020-01-01")
+    assert validate_pair(first=first, second=second)["keep_package"] == \
+        "nfdi4chem-mol100"
+    first["title"] = second["title"]
+    first["metadata_created"] = second["metadata_created"]
+    assert validate_pair(first=first, second=second)["keep_package"] == \
+        "nfdi4chem-mol100"
+
+
+def test_manifest_output_contains_only_required_columns(tmp_path):
+    output = tmp_path / "dedup.csv"
+    cli._write_dedup_manifest(str(output), [validate_pair()])
+    assert output.read_text().splitlines() == [
+        "inchi_key,keep_package,remove_package",
+        ETHANOL_KEY + ",nfdi4chem-mol100,nfdi4chem-mol200",
+    ]
+
+
+def test_dedup_command_exposes_no_apply_option():
+    result = CliRunner().invoke(
+        cli.harvester4chem,
+        ["deduplicate-molecule-packages", "--apply", "--manifest-out", "x"])
+    assert result.exit_code != 0
+    assert "No such option: --apply" in result.output
+
+
+def test_dedup_sql_is_read_only_and_code_never_commits():
+    source = open(cli.__file__, "r").read()
+    dedup_source = source[source.index("DUPLICATE_GROUPS_SQL"):]
+    sql = " ".join(str(cli.DUPLICATE_GROUPS_SQL).upper().split())
+    assert "UPDATE " not in sql and "DELETE " not in sql and "INSERT " not in sql
+    assert "SESSION.COMMIT" not in dedup_source.upper()
+    assert "package_delete" not in dedup_source
+    assert "package_update" not in dedup_source
+    assert "package_patch" not in dedup_source
+
+
+def test_empty_dedup_audit_rolls_back_and_only_writes_manifest(tmp_path):
+    class ReadOnlyAuditSession(object):
+        def __init__(self):
+            self.rolled_back = 0
+
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            assert not sql.upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            if statement is cli.DUPLICATE_GROUPS_SQL:
+                return BackfillResult([])
+            if "FROM public.package" in sql:
+                return BackfillResult([(25495,)])
+            if "FROM rdk.molecules" in sql:
+                return BackfillResult([(25413,)])
+            if "FROM rdk.fingerprints" in sql:
+                return BackfillResult([(25413,)])
+            raise AssertionError(sql)
+
+        def rollback(self):
+            self.rolled_back += 1
+
+        def commit(self):
+            pytest.fail("dry-run audit must never commit")
+
+    session = ReadOnlyAuditSession()
+    output = tmp_path / "empty.csv"
+    plans, blocked, summary = cli.deduplicate_molecule_packages_dry_run(
+        session, str(output))
+    assert plans == [] and blocked == []
+    assert summary["database_changed"] is False
+    assert session.rolled_back == 1
+    assert output.read_text().strip() == \
+        "inchi_key,keep_package,remove_package"
