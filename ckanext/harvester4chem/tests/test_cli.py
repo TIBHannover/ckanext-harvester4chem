@@ -1,7 +1,11 @@
+import pytest
+from click.testing import CliRunner
+
+from ckanext.harvester4chem import cli
 from ckanext.harvester4chem.cli import VERIFY_SQL
 
 
-AUTHORITATIVE = "dataset_chemistry_missing_molecule_package"
+LEGACY_DATASET_AUDIT = "legacy_dataset_chemistry_missing_molecule_package"
 DATASET_EXTRA_AUDIT = "dataset_extra_inchikey_missing_molecule_package"
 
 
@@ -31,11 +35,35 @@ def _missing_pairs(dataset_keys, molecule_keys):
                 if pair[1] not in active_molecule_keys])
 
 
+@pytest.mark.parametrize("flag, expected", [
+    (None, None), ("--write-legacy", True), ("--no-write-legacy", False)])
+def test_sync_package_legacy_override_is_optional(monkeypatch, flag, expected):
+    captured = {}
+    package = {"id": "dataset-id", "smiles": "CCO", "title": "Ethanol"}
+    monkeypatch.setattr(cli.toolkit, "get_action",
+                        lambda name: lambda context, data: package)
+
+    def synchronize(**kwargs):
+        captured.update(kwargs)
+        return {"legacy": {"status": "skipped",
+                           "relationship": "skipped"}}
+
+    monkeypatch.setattr(cli, "synchronize_molecule", synchronize)
+    monkeypatch.setattr(cli.model.Session, "rollback", lambda: None)
+    args = ["sync-package", "dataset-id", "--dry-run"]
+    if flag:
+        args.append(flag)
+    result = CliRunner().invoke(cli.harvester4chem, args)
+    assert result.exit_code == 0
+    assert captured["write_legacy"] is expected
+    assert captured["dry_run"] is True
+
+
 def test_verification_queries_are_read_only_and_cover_required_checks():
     assert set(VERIFY_SQL) == {
         "legacy_relationships_missing_public_molecule",
         "duplicate_legacy_package_molecule_relationships",
-        AUTHORITATIVE,
+        LEGACY_DATASET_AUDIT,
         DATASET_EXTRA_AUDIT,
         "ambiguous_duplicate_molecule_packages",
         "molecule_packages_missing_rdk_molecule",
@@ -59,8 +87,8 @@ def test_verification_queries_are_read_only_and_cover_required_checks():
     assert "LEFT JOIN RELATIONSHIP_RELATIONSHIP" not in missing_relationship_sql
 
 
-def test_authoritative_query_follows_only_the_legacy_relationship_mapping():
-    sql = _sql(AUTHORITATIVE)
+def test_legacy_dataset_audit_follows_only_legacy_relationship_mapping():
+    sql = _sql(LEGACY_DATASET_AUDIT)
     assert "FROM PUBLIC.MOLECULE_REL_DATA REL" in sql
     assert "JOIN PUBLIC.MOLECULES LEGACY ON LEGACY.ID=REL.MOLECULES_ID" in sql
     assert "DATASET.ID=REL.PACKAGE_ID" in sql
@@ -70,8 +98,8 @@ def test_authoritative_query_follows_only_the_legacy_relationship_mapping():
     assert "MOLECULE_ID" not in sql
 
 
-def test_authoritative_query_uses_distinct_normalized_pairs_and_not_exists():
-    sql = _sql(AUTHORITATIVE)
+def test_legacy_dataset_audit_uses_distinct_normalized_pairs_and_not_exists():
+    sql = _sql(LEGACY_DATASET_AUDIT)
     assert "SELECT DISTINCT REL.PACKAGE_ID AS DATASET_ID" in sql
     assert "LEGACY.INCHI_KEY IS NOT NULL" in sql
     assert "BTRIM(LEGACY.INCHI_KEY)<>''" in sql

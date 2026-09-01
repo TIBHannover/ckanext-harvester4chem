@@ -21,10 +21,9 @@ VERIFY_SQL = {
           GROUP BY package_id,molecules_id HAVING count(*) > 1
         ) duplicate
     """),
-    # Authoritative migration check: follow the legacy dataset-to-chemical
-    # relationship and ask whether that chemical identity has been migrated
-    # to at least one active CKAN molecule package.
-    "dataset_chemistry_missing_molecule_package": text("""
+    # Historical legacy-table integrity check. It cannot cover post-cutover
+    # harvests when ckan.harvester4chem.write_legacy is disabled.
+    "legacy_dataset_chemistry_missing_molecule_package": text("""
         WITH dataset_molecule_keys AS (
           SELECT DISTINCT
             rel.package_id AS dataset_id,
@@ -191,7 +190,10 @@ def verify_command():
 @click.argument("package_id")
 @click.option("--dry-run", is_flag=True, required=True,
               help="Execute all SQL and roll it back.")
-def sync_package_command(package_id, dry_run):
+@click.option("--write-legacy/--no-write-legacy", default=None,
+              help=("Diagnostic override for legacy-table validation; the "
+                    "default is ckan.harvester4chem.write_legacy."))
+def sync_package_command(package_id, dry_run, write_legacy):
     """Validate and dry-run synchronization of one existing CKAN package."""
     package = toolkit.get_action("package_show")(
         {"ignore_auth": True}, {"id": package_id}
@@ -208,6 +210,7 @@ def sync_package_command(package_id, dry_run):
         name_source="CKAN",
         session=model.Session,
         dry_run=dry_run,
+        write_legacy=write_legacy,
     )
     model.Session.rollback()
     click.echo(json.dumps(result, sort_keys=True))

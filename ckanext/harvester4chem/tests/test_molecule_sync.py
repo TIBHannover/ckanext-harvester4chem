@@ -119,6 +119,31 @@ def run(session, actions, **overrides):
     return molecule_sync.synchronize_molecule(**values)
 
 
+@pytest.mark.parametrize("configured", [None, False, "false", "no", "0"])
+def test_legacy_configuration_defaults_to_false_and_accepts_false_values(
+        monkeypatch, configured):
+    config = {} if configured is None else {
+        molecule_sync.WRITE_LEGACY_CONFIG: configured}
+    monkeypatch.setattr(molecule_sync.toolkit, "config", config)
+    assert molecule_sync.legacy_writes_enabled() is False
+
+
+@pytest.mark.parametrize("configured", [True, "true", "yes", "1"])
+def test_legacy_configuration_accepts_true_values(monkeypatch, configured):
+    monkeypatch.setattr(molecule_sync.toolkit, "config", {
+        molecule_sync.WRITE_LEGACY_CONFIG: configured})
+    assert molecule_sync.legacy_writes_enabled() is True
+
+
+def test_explicit_legacy_value_overrides_configuration(monkeypatch):
+    monkeypatch.setattr(molecule_sync.toolkit, "config", {
+        molecule_sync.WRITE_LEGACY_CONFIG: "yes"})
+    assert molecule_sync.legacy_writes_enabled(False) is False
+    monkeypatch.setattr(molecule_sync.toolkit, "config", {
+        molecule_sync.WRITE_LEGACY_CONFIG: "no"})
+    assert molecule_sync.legacy_writes_enabled(True) is True
+
+
 def existing_package(session, actions, names=None):
     values = molecule_sync.normalize_structure(smiles="CCO")
     package = molecule_sync._package_payload(values, names or ["Ethanol"])
@@ -171,7 +196,7 @@ def test_inchi_key_mismatch_performs_no_write():
 def test_workflow_keeps_legacy_and_rdkit_identifiers_separate():
     session, actions = FakeSession(), Actions()
     existing_package(session, actions)
-    result = run(session, actions)
+    result = run(session, actions, write_legacy=True)
     assert result["legacy"]["legacy_molecule_id"] == 10
     assert result["rdk_molecule_id"] == 101
     assert session.state["legacy_rel"] == {("dataset-id", 10)}
@@ -222,8 +247,8 @@ def test_new_relationship_write_is_blocked_before_committing_action():
 def test_second_execution_is_idempotent():
     session, actions = FakeSession(), Actions()
     package = existing_package(session, actions)
-    first = run(session, actions)
-    second = run(session, actions, names=["ethanol"])
+    first = run(session, actions, write_legacy=True)
+    second = run(session, actions, names=["ethanol"], write_legacy=True)
     assert second["molecule_package"] == "existing"
     assert len(session.state["legacy"]) == 1
     assert len(session.state["legacy_rel"]) == 1
@@ -314,6 +339,38 @@ def test_dry_run_validates_every_stage_and_performs_no_writes():
     assert any(name == "relationship_relations_list" for name, _ in actions.calls)
     assert any(sql.startswith("INSERT INTO rdk.molecules")
                for sql, _ in session.sql)
+
+
+def test_disabled_mode_skips_all_legacy_sql_but_runs_modern_sync(monkeypatch):
+    monkeypatch.setattr(molecule_sync.toolkit, "config", {})
+    session, actions = FakeSession(), Actions()
+    package = existing_package(session, actions)
+    result = run(session, actions)
+    sql = " ".join(item[0].lower() for item in session.sql)
+    assert "public.molecules" not in sql
+    assert "public.molecule_rel_data" not in sql
+    assert result["legacy"] == {
+        "status": "skipped", "relationship": "skipped",
+        "reason": "legacy writes disabled"}
+    assert result["molecule_package_id"] == package["id"]
+    assert result["rdk_molecule_id"] == 101
+    assert session.state["fingerprints"] == {101}
+
+
+@pytest.mark.parametrize("write_legacy", [False, True])
+def test_dry_run_rolls_back_in_both_legacy_modes(write_legacy):
+    session, actions = FakeSession(), Actions()
+    before = copy.deepcopy(session.state)
+    result = run(session, actions, dry_run=True,
+                 write_legacy=write_legacy)
+    assert result["dry_run"] is True
+    assert session.state == before
+    assert any(sql.startswith("INSERT INTO rdk.molecules")
+               for sql, _ in session.sql)
+    legacy_sql = any("public.molecules" in sql or
+                     "public.molecule_rel_data" in sql
+                     for sql, _ in session.sql)
+    assert legacy_sql is write_legacy
 
 
 def test_invalid_input_fails_before_any_write():

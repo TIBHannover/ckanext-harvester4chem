@@ -109,13 +109,34 @@ In `/etc/ckan/default/ckan.ini`
 
 ## Config settings
 
-None at present
+Legacy compatibility writes are disabled by default:
 
-**TODO:** Document any optional config settings here. For example:
+    ckan.harvester4chem.write_legacy = false
 
-	# The minimum number of hours to wait before re-checking a resource
-	# (optional, default: 24).
-	ckanext.harvester4chem.some_setting = some_default_value
+This setting controls only synchronization performed by
+`ckanext-harvester4chem`. Existing rows in `public.molecules` and
+`public.molecule_rel_data` are retained, and other extensions may continue to
+use those tables. Disabling the option does not drop or migrate any data.
+
+The `harvester4chem sync-package --dry-run` command uses this configured value.
+Its `--write-legacy` and `--no-write-legacy` flags are diagnostic overrides;
+the command remains dry-run-only in either mode.
+
+The verifier's `legacy_relationships_missing_public_molecule`,
+`duplicate_legacy_package_molecule_relationships`, and
+`legacy_dataset_chemistry_missing_molecule_package` results are historical
+legacy-table integrity checks. They do not cover new post-cutover records when
+legacy writes are disabled. `dataset_extra_inchikey_missing_molecule_package`
+audits active dataset metadata more broadly, while
+`dataset_molecule_package_relationships_missing` checks CKAN relationships
+directly.
+
+The synchronization module is not currently called by a real harvester import
+path. `Harvester4ChemPlugin` implements only `IConfigurer` and `IClick`, so
+harvests (including the recent Chemotion harvest) do not use this synchronizer.
+Connecting it requires a separate design change. Live creation of a new CKAN
+relationship is also intentionally blocked because the installed relationship
+action commits independently.
 
 
 ## Developer installation

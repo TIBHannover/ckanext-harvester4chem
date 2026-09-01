@@ -17,10 +17,20 @@ TECHNICAL_MOLECULE_NAME = re.compile(
     r"^(?:nfdi4chem-mol[0-9]+|molecule-[a-z0-9-]+)"
     r"(?: \(unknown molecule\))?$", re.IGNORECASE
 )
+WRITE_LEGACY_CONFIG = "ckan.harvester4chem.write_legacy"
 
 
 class MoleculeSyncError(Exception):
     """Chemistry metadata cannot be synchronized without corrupting data."""
+
+
+def legacy_writes_enabled(value=None):
+    """Resolve the explicit override or CKAN's boolean configuration value."""
+    if value is not None:
+        if isinstance(value, bool):
+            return value
+        return toolkit.asbool(value)
+    return toolkit.asbool(toolkit.config.get(WRITE_LEGACY_CONFIG, False))
 
 
 def clean_value(value):
@@ -328,7 +338,7 @@ def ensure_dataset_molecule_package_relationship(dataset_id, molecule_id,
 def synchronize_molecule(package_id, inchi_code=None, inchi_key=None,
                          smiles=None, mol_formula=None, exact_mass=None,
                          names=None, name_source="CKAN", session=None,
-                         dry_run=False, action_getter=None):
+                         dry_run=False, action_getter=None, write_legacy=None):
     package_id, session = clean_value(package_id), session or model.Session
     if not package_id:
         raise MoleculeSyncError("missing dataset package ID")
@@ -336,7 +346,12 @@ def synchronize_molecule(package_id, inchi_code=None, inchi_key=None,
                                  mol_formula, exact_mass)
     savepoint = session.begin_nested() if dry_run else None
     try:
-        legacy = synchronize_legacy_molecule_relation(package_id, values, session)
+        if legacy_writes_enabled(write_legacy):
+            legacy = synchronize_legacy_molecule_relation(
+                package_id, values, session)
+        else:
+            legacy = {"status": "skipped", "relationship": "skipped",
+                      "reason": "legacy writes disabled"}
         package, duplicates, created = ensure_molecule_package(
             values, names, session, action_getter, dry_run)
         rdk_molecule_id = synchronize_molecule_package_with_rdk(
@@ -360,7 +375,7 @@ def synchronize_molecule(package_id, inchi_code=None, inchi_key=None,
 
 def synchronize_harvested_package(package_dict, harvest_object, names=None,
                                   name_source="CKAN", session=None,
-                                  dry_run=False):
+                                  dry_run=False, write_legacy=None):
     package_id = getattr(harvest_object, "package_id", None) or package_dict.get("id")
     package = model.Package.get(package_id)
     if package is not None:
@@ -370,7 +385,8 @@ def synchronize_harvested_package(package_dict, harvest_object, names=None,
             package_id, package_dict.get("inchi"), package_dict.get("inchi_key"),
             package_dict.get("smiles"), package_dict.get("mol_formula"),
             package_dict.get("exactmass") if package_dict.get("exactmass") is not None else package_dict.get("exact_mass"),
-            names, name_source, session, dry_run)
+            names, name_source, session, dry_run,
+            write_legacy=write_legacy)
     except Exception as error:
         log.error("HARVESTER4CHEM molecule_sync package=%s failed: %s", package_id, error)
         raise
