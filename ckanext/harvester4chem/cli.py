@@ -1,5 +1,6 @@
 import csv
 import json
+import time
 
 import click
 from sqlalchemy import text
@@ -977,7 +978,7 @@ def _recovery_checks(entry):
         "dataset_inchi_key_extra_state": None,
         "matching_legacy_molecule_ids": [],
         "normalized_legacy_inchi_keys": [],
-        "identity_source": None,
+        "dataset_identity_source": None,
         "retained_molecule_inchi_key": None,
         "removed_molecule_inchi_key": None,
         "rdk_molecule_id": None,
@@ -1025,7 +1026,7 @@ def _recovery_preflight_entry(session, entry):
     if dataset_keys:
         if dataset_keys != [expected]:
             fail("nonblank dataset InChIKey conflicts with recovery manifest")
-        checks["identity_source"] = "dataset_extra"
+        checks["dataset_identity_source"] = "dataset_extra"
     else:
         legacy = _legacy_dataset_identities(session, dataset["id"])
         checks["normalized_legacy_inchi_keys"] = [key for molecule_id, key
@@ -1034,7 +1035,7 @@ def _recovery_preflight_entry(session, entry):
             molecule_id for molecule_id, key in legacy if key == expected]
         if not checks["matching_legacy_molecule_ids"]:
             fail("dataset has no matching legacy molecule relationship")
-        checks["identity_source"] = "legacy_relationship"
+        checks["dataset_identity_source"] = "legacy_relationship"
     checks["stages"]["dataset_identity"] = "validated"
 
     keep_key = normalized_inchi_key(_package_value(keep, "inchi_key"))
@@ -1076,12 +1077,25 @@ def _recovery_preflight_entry(session, entry):
 def _relationship_audit(entry, status, preflight=None, creation=None,
                         reciprocal=None, solr=None, error=None):
     evidence = preflight or {}
+    reindex_results = list(solr.values()) if isinstance(solr, dict) else []
+    reindex_errors = [
+        {"package_id": item.get("package_id"),
+         "package_name": item.get("package_name"),
+         "package_type": item.get("package_type"),
+         "error": item.get("error")}
+        for item in reindex_results if item.get("error")]
+    relationship_status = ("already_present" if status.startswith(
+        "already_present") else "created" if status.startswith("created")
+        else status)
     return {"dataset_package": entry["dataset_package"],
             "retained_molecule": entry["keep_package"],
             "removed_molecule": entry["remove_package"],
             "inchi_key": entry["inchi_key"],
             "manifest_inchi_key": entry["inchi_key"],
             "relation_type": entry["relation_type"],
+            "relationship_status": relationship_status,
+            "forward_row_count": (reciprocal or {}).get("forward_rows"),
+            "reverse_row_count": (reciprocal or {}).get("reverse_rows"),
             "normalized_nonblank_dataset_inchi_keys": evidence.get(
                 "normalized_nonblank_dataset_inchi_keys"),
             "dataset_inchi_key_extra_state": evidence.get(
@@ -1090,7 +1104,7 @@ def _relationship_audit(entry, status, preflight=None, creation=None,
                 "matching_legacy_molecule_ids"),
             "normalized_legacy_inchi_keys": evidence.get(
                 "normalized_legacy_inchi_keys"),
-            "identity_source": evidence.get("identity_source"),
+            "identity_source": evidence.get("dataset_identity_source"),
             "retained_molecule_inchi_key": evidence.get(
                 "retained_molecule_inchi_key"),
             "removed_molecule_inchi_key": evidence.get(
@@ -1100,7 +1114,16 @@ def _relationship_audit(entry, status, preflight=None, creation=None,
             "preflight_result": preflight,
             "creation_result": creation,
             "reciprocal_row_verification": reciprocal,
+            "dataset_reindex_result": (solr or {}).get("dataset")
+                if isinstance(solr, dict) else None,
+            "retained_molecule_reindex_result": (solr or {}).get(
+                "retained_molecule") if isinstance(solr, dict) else None,
             "solr_reindex_result": solr,
+            "reindex_attempt_count": sum(
+                item.get("attempts", 0) for item in reindex_results),
+            "errors": ([{"scope": "relationship", "error": error}]
+                       if error else []) + reindex_errors,
+            "processing_continued_after_warning": False,
             "status": status, "error": error}
 
 
@@ -1110,14 +1133,72 @@ def _append_relationship_audit(filename, record):
         audit.flush()
 
 
-def _reindex_recovery_packages(dataset, keep, action_getter):
+def _normalize_package_for_index(package):
+    normalized = dict(package)
+    for field in ("extras", "resources", "tags", "groups"):
+        if normalized.get(field) is None:
+            normalized[field] = []
+    if normalized.get("organization") is None:
+        normalized["organization"] = {}
+    return normalized
+
+
+def _reindex_recovery_package(package, action_getter, index_factory=None,
+                              sleep=None, attempts=3, retry_delay=0.1):
     from ckan.lib.search.index import PackageSearchIndex
-    index = PackageSearchIndex()
-    for package in (dataset, keep):
-        fresh = action_getter("package_show")(
-            {"ignore_auth": True}, {"id": package["id"]})
-        index.index_package(fresh)
-    return {"dataset": "reindexed", "retained_molecule": "reindexed"}
+    index_factory = index_factory or PackageSearchIndex
+    sleep = sleep or time.sleep
+    result = {"package_id": package["id"], "package_name": package["name"],
+              "package_type": package.get("type"), "status": "failed",
+              "attempts": 0, "error": None,
+              "cached_reindex_reused": False}
+    for attempt in range(1, attempts + 1):
+        result["attempts"] = attempt
+        try:
+            fresh = action_getter("package_show")(
+                {"ignore_auth": True}, {"id": package["id"]})
+            fresh = _normalize_package_for_index(fresh)
+            result["package_name"] = fresh.get("name", result["package_name"])
+            result["package_type"] = fresh.get("type", result["package_type"])
+            index_factory().index_package(fresh)
+            result["status"] = "reindexed"
+            result["error"] = None
+            return result
+        except Exception as error:
+            result["error"] = str(error)
+            if attempt < attempts:
+                sleep(min(max(retry_delay, 0), 1))
+    return result
+
+
+def _cached_reindex_result(package):
+    return {"package_id": package["id"], "package_name": package["name"],
+            "package_type": package.get("type"), "status": "cached",
+            "attempts": 0, "error": None, "cached_reindex_reused": True}
+
+
+def _failed_reindex_result(package, error):
+    return {"package_id": package["id"], "package_name": package["name"],
+            "package_type": package.get("type"), "status": "failed",
+            "attempts": 0, "error": str(error),
+            "cached_reindex_reused": False}
+
+
+def _reindex_recovery_pair(dataset, keep, action_getter, reindexer, cache):
+    try:
+        dataset_result = reindexer(dataset, action_getter)
+    except Exception as error:
+        dataset_result = _failed_reindex_result(dataset, error)
+    if keep["id"] in cache:
+        keep_result = _cached_reindex_result(keep)
+    else:
+        try:
+            keep_result = reindexer(keep, action_getter)
+        except Exception as error:
+            keep_result = _failed_reindex_result(keep, error)
+        if keep_result["status"] == "reindexed":
+            cache.add(keep["id"])
+    return {"dataset": dataset_result, "retained_molecule": keep_result}
 
 
 def recover_dedup_relationships(session, manifest, expected_relationships,
@@ -1129,7 +1210,7 @@ def recover_dedup_relationships(session, manifest, expected_relationships,
             "expected-relationships {0} does not match manifest entry count {1}"
             .format(expected_relationships, len(entries)))
     action_getter = action_getter or toolkit.get_action
-    reindexer = reindexer or _reindex_recovery_packages
+    reindexer = reindexer or _reindex_recovery_package
     validated, failures = [], []
     for entry in entries:
         try:
@@ -1150,27 +1231,38 @@ def recover_dedup_relationships(session, manifest, expected_relationships,
         raise MoleculeSyncError(
             "relationship recovery preflight failed; no mutations performed")
     if not apply_mode:
+        results = []
         for entry, dataset, keep, remove, checks, already in validated:
             status = "already_present" if already else "validated"
-            _append_relationship_audit(audit_log, _relationship_audit(
-                entry, status, preflight=checks))
+            record = _relationship_audit(entry, status, preflight=checks)
+            _append_relationship_audit(audit_log, record)
+            results.append(record)
         session.rollback()
-        return ["already_present" if item[5] else "validated"
-                for item in validated]
+        summary = {"requested": len(entries), "created": 0,
+                   "already_present": sum(int(item[5]) for item in validated),
+                   "relationship_failures": 0, "reindex_warnings": 0,
+                   "completed": len(results)}
+        return results, summary
 
-    results = []
+    results, reindex_cache = [], set()
     for entry, dataset, keep, remove, checks, already in validated:
         if already:
             relationship_check = (checks.get("relationship") or
                                   checks.get("stages", {}).get("relationship"))
+            solr = _reindex_recovery_pair(
+                dataset, keep, action_getter, reindexer, reindex_cache)
+            warning = any(item["status"] == "failed"
+                          for item in solr.values())
             record = _relationship_audit(
-                entry, "already_present", preflight=checks,
-                reciprocal=relationship_check, solr="no_action")
+                entry, ("already_present_with_reindex_warning" if warning
+                        else "already_present"), preflight=checks,
+                reciprocal=relationship_check, solr=solr)
+            record["processing_continued_after_warning"] = warning
             _append_relationship_audit(audit_log, record)
             results.append(record)
             continue
         try:
-            created, reciprocal, solr = None, None, None
+            created, reciprocal = None, None
             created = action_getter("relationship_relation_create")(
                 {"model": model, "session": session,
                  "ignore_auth": True, "user": "harvest"},
@@ -1184,21 +1276,39 @@ def recover_dedup_relationships(session, manifest, expected_relationships,
             if not forward or not reverse:
                 raise MoleculeSyncError(
                     "relationship action did not create reciprocal rows")
-            solr = reindexer(dataset, keep, action_getter)
-            record = _relationship_audit(
-                entry, "created", preflight=checks, creation=created,
-                reciprocal=reciprocal, solr=solr)
-            _append_relationship_audit(audit_log, record)
-            results.append(record)
         except Exception as error:
             session.rollback()
             record = _relationship_audit(
                 entry, "failed", preflight=checks, creation=created,
                 reciprocal=reciprocal, error=str(error),
-                solr=solr or "unknown_after_action_failure")
+                solr=None)
+            record["processing_continued_after_warning"] = False
             _append_relationship_audit(audit_log, record)
             raise
-    return results
+        solr = _reindex_recovery_pair(
+            dataset, keep, action_getter, reindexer, reindex_cache)
+        warning = any(item["status"] == "failed" for item in solr.values())
+        record = _relationship_audit(
+            entry, "created_with_reindex_warning" if warning else "created",
+            preflight=checks, creation=created, reciprocal=reciprocal,
+            solr=solr)
+        record["processing_continued_after_warning"] = warning
+        _append_relationship_audit(audit_log, record)
+        results.append(record)
+    summary = {
+        "requested": len(entries),
+        "created": sum(int(item["status"].startswith("created"))
+                       for item in results),
+        "already_present": sum(
+            int(item["status"].startswith("already_present"))
+            for item in results),
+        "relationship_failures": 0,
+        "reindex_warnings": sum(
+            int(item["status"].endswith("reindex_warning"))
+            for item in results),
+        "completed": len(results),
+    }
+    return results, summary
 
 
 @click.group(name="harvester4chem")
@@ -1345,7 +1455,7 @@ def recover_dedup_relationships_command(dry_run, apply_mode, manifest,
         raise click.UsageError(
             "--apply requires --confirm RECOVER_VALIDATED_RELATIONSHIPS")
     try:
-        results = recover_dedup_relationships(
+        results, summary = recover_dedup_relationships(
             model.Session, manifest, expected_relationships, audit_log,
             apply_mode=apply_mode)
     except Exception as error:
@@ -1353,6 +1463,7 @@ def recover_dedup_relationships_command(dry_run, apply_mode, manifest,
     for result in results:
         click.echo(json.dumps(result, sort_keys=True)
                    if isinstance(result, dict) else result)
+    click.echo(json.dumps(summary, sort_keys=True))
 
 
 def get_commands():

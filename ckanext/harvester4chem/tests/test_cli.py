@@ -1204,7 +1204,7 @@ def test_recovery_uses_matching_legacy_when_dataset_extra_missing(
     checks = result[3]
     assert checks["dataset_inchi_key_extra_state"] == dataset_extra
     assert checks["matching_legacy_molecule_ids"] == [8]
-    assert checks["identity_source"] == "legacy_relationship"
+    assert checks["dataset_identity_source"] == "legacy_relationship"
     assert checks["rdk_molecule_id"] == 42
 
 
@@ -1212,7 +1212,7 @@ def test_recovery_prefers_matching_nonblank_dataset_extra(monkeypatch):
     checks = recovery_preflight(
         monkeypatch, dataset_extra=ETHANOL_KEY,
         legacy=[(8, "DIFFERENTLEGACY-UHFFFAOYSA-N")])[3]
-    assert checks["identity_source"] == "dataset_extra"
+    assert checks["dataset_identity_source"] == "dataset_extra"
     assert checks["matching_legacy_molecule_ids"] == []
 
 
@@ -1306,10 +1306,16 @@ def test_recovery_calls_create_once_and_verifies_reciprocal_rows(
                     {"relation_type": "related_to"}]
         return action
 
-    result = cli.recover_dedup_relationships(
+    def reindexer(package, getter):
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package.get("type"), "status": "reindexed",
+                "attempts": 1, "error": None,
+                "cached_reindex_reused": False}
+
+    result, summary = cli.recover_dedup_relationships(
         Session(), manifest, 1, str(tmp_path / "audit.jsonl"),
         apply_mode=True, action_getter=actions,
-        reindexer=lambda dataset, keep, getter: {"both": "reindexed"})
+        reindexer=reindexer)
     assert [name for name, data in calls] == [
         "relationship_relation_create"]
     assert calls[0][1] == {"subject_id": "dataset-id",
@@ -1318,6 +1324,9 @@ def test_recovery_calls_create_once_and_verifies_reciprocal_rows(
     assert result[0]["reciprocal_row_verification"] == {
         "forward_rows": 1, "reverse_rows": 1}
     assert result[0]["status"] == "created"
+    assert summary == {"requested": 1, "created": 1,
+                       "already_present": 0, "relationship_failures": 0,
+                       "reindex_warnings": 0, "completed": 1}
 
 
 def test_recovery_already_present_is_idempotent(monkeypatch, tmp_path):
@@ -1332,13 +1341,24 @@ def test_recovery_already_present_is_idempotent(monkeypatch, tmp_path):
         def rollback(self):
             pass
 
-    calls = []
-    result = cli.recover_dedup_relationships(
+    actions = []
+    indexed = []
+
+    def reindexer(package, getter):
+        indexed.append(package["id"])
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package.get("type"), "status": "reindexed",
+                "attempts": 1, "error": None,
+                "cached_reindex_reused": False}
+
+    result, summary = cli.recover_dedup_relationships(
         Session(), manifest, 1, str(tmp_path / "audit.jsonl"),
-        apply_mode=True, action_getter=lambda name: calls.append(name),
-        reindexer=lambda *args: calls.append("reindex"))
-    assert calls == []
+        apply_mode=True, action_getter=lambda name: actions.append(name),
+        reindexer=reindexer)
+    assert actions == []
+    assert indexed == ["id", "id"]
     assert result[0]["status"] == "already_present"
+    assert summary["already_present"] == 1
 
 
 def test_recovery_complete_preflight_precedes_mutation(monkeypatch, tmp_path):
@@ -1366,3 +1386,264 @@ def test_recovery_complete_preflight_precedes_mutation(monkeypatch, tmp_path):
             Session(), manifest, 2, str(tmp_path / "audit.jsonl"),
             apply_mode=True, action_getter=lambda name: actions.append(name))
     assert actions == []
+
+
+def test_recovery_index_normalizes_optional_collections_and_preserves_extras():
+    original_extras = [{"key": "one", "value": "two"}]
+    package = {"id": "package-id", "name": "package", "type": "dataset"}
+    shown = [dict(package), dict(package, extras=None),
+             dict(package, extras=original_extras)]
+    indexed = []
+
+    def getter(name):
+        assert name == "package_show"
+        return lambda context, data: shown.pop(0)
+
+    class Index(object):
+        def index_package(self, value):
+            indexed.append(value)
+
+    for unused in range(3):
+        result = cli._reindex_recovery_package(
+            package, getter, index_factory=Index, sleep=lambda delay: None)
+        assert result["status"] == "reindexed"
+    assert indexed[0]["extras"] == []
+    assert indexed[1]["extras"] == []
+    assert indexed[2]["extras"] is original_extras
+    for value in indexed:
+        assert value["resources"] == []
+        assert value["tags"] == []
+        assert value["groups"] == []
+        assert value["organization"] == {}
+
+
+@pytest.mark.parametrize("failing_id", ["dataset-id", "keep-id"])
+def test_recovery_individual_index_retry_succeeds(failing_id):
+    packages = {
+        "dataset-id": {"id": "dataset-id", "name": "dataset",
+                       "type": "dataset"},
+        "keep-id": {"id": "keep-id", "name": "keep", "type": "molecule"},
+    }
+    shows, indexes, sleeps = [], [], []
+
+    def getter(name):
+        def show(context, data):
+            shows.append(data["id"])
+            return dict(packages[data["id"]])
+        return show
+
+    class Index(object):
+        def index_package(self, package):
+            indexes.append(package["id"])
+            if package["id"] == failing_id and indexes.count(failing_id) == 1:
+                raise RuntimeError("temporary Solr error")
+
+    def reindexer(package, action_getter):
+        return cli._reindex_recovery_package(
+            package, action_getter, index_factory=Index,
+            sleep=sleeps.append, retry_delay=0.25)
+
+    result = cli._reindex_recovery_pair(
+        packages["dataset-id"], packages["keep-id"], getter,
+        reindexer, set())
+    assert result["dataset"]["status"] == "reindexed"
+    assert result["retained_molecule"]["status"] == "reindexed"
+    assert result[("dataset" if failing_id == "dataset-id" else
+                   "retained_molecule")]["attempts"] == 2
+    assert shows.count(failing_id) == 2
+    assert sleeps == [0.25]
+
+
+def test_recovery_dataset_permanent_failure_still_attempts_molecule():
+    dataset = {"id": "dataset-id", "name": "dataset", "type": "dataset"}
+    keep = {"id": "keep-id", "name": "keep", "type": "molecule"}
+    attempted = []
+
+    def reindexer(package, getter):
+        attempted.append(package["id"])
+        if package["id"] == "dataset-id":
+            return {"package_id": package["id"], "package_name": package["name"],
+                    "package_type": package["type"], "status": "failed",
+                    "attempts": 3, "error": "Solr unavailable",
+                    "cached_reindex_reused": False}
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package["type"], "status": "reindexed",
+                "attempts": 1, "error": None,
+                "cached_reindex_reused": False}
+
+    result = cli._reindex_recovery_pair(
+        dataset, keep, None, reindexer, set())
+    assert attempted == ["dataset-id", "keep-id"]
+    assert result["dataset"]["attempts"] == 3
+    assert result["retained_molecule"]["status"] == "reindexed"
+
+
+def test_recovery_retained_molecule_cache_only_keeps_successes():
+    dataset = {"id": "dataset-id", "name": "dataset", "type": "dataset"}
+    keep = {"id": "keep-id", "name": "keep", "type": "molecule"}
+    calls, cache = [], set()
+
+    def successful(package, getter):
+        calls.append(package["id"])
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package["type"], "status": "reindexed",
+                "attempts": 1, "error": None,
+                "cached_reindex_reused": False}
+
+    cli._reindex_recovery_pair(dataset, keep, None, successful, cache)
+    second = cli._reindex_recovery_pair(dataset, keep, None, successful, cache)
+    assert calls == ["dataset-id", "keep-id", "dataset-id"]
+    assert second["retained_molecule"]["cached_reindex_reused"] is True
+
+    failed_cache, failures = set(), []
+
+    def failed(package, getter):
+        failures.append(package["id"])
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package["type"], "status": "failed",
+                "attempts": 3, "error": "still down",
+                "cached_reindex_reused": False}
+
+    cli._reindex_recovery_pair(dataset, keep, None, failed, failed_cache)
+    cli._reindex_recovery_pair(dataset, keep, None, failed, failed_cache)
+    assert failures.count("keep-id") == 2
+    assert failed_cache == set()
+
+
+def test_recovery_solr_warning_is_audited_and_next_entry_continues(
+        monkeypatch, tmp_path):
+    manifest = recovery_manifest(
+        tmp_path,
+        "AAAAAAAAAAAAAA-UHFFFAOYSA-N,dataset-one,keep-one,remove-one,related_to\n"
+        "BBBBBBBBBBBBBB-UHFFFAOYSA-N,dataset-two,keep-one,remove-two,related_to\n")
+
+    def preflight(session, entry):
+        dataset = {"id": entry["dataset_package"],
+                   "name": entry["dataset_package"], "type": "dataset"}
+        keep = {"id": "keep-one", "name": "keep-one", "type": "molecule"}
+        remove = {"id": entry["remove_package"],
+                  "name": entry["remove_package"], "type": "molecule"}
+        checks = {"dataset_identity_source": "legacy_relationship",
+                  "relationship": {"forward_rows": 0, "reverse_rows": 0}}
+        return dataset, keep, remove, checks, False
+
+    monkeypatch.setattr(cli, "_recovery_preflight_entry", preflight)
+
+    class Result(object):
+        def scalar(self):
+            return 1
+
+    class Session(object):
+        def execute(self, statement, params=None):
+            return Result()
+
+        def rollback(self):
+            pass
+
+    created, indexed = [], []
+
+    def actions(name):
+        def action(context, data):
+            created.append(data["subject_id"])
+            return {"ok": True}
+        return action
+
+    def reindexer(package, getter):
+        indexed.append(package["id"])
+        failed = package["id"] == "dataset-one"
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package["type"],
+                "status": "failed" if failed else "reindexed",
+                "attempts": 3 if failed else 1,
+                "error": "Solr unavailable" if failed else None,
+                "cached_reindex_reused": False}
+
+    audit = tmp_path / "audit.jsonl"
+    results, summary = cli.recover_dedup_relationships(
+        Session(), manifest, 2, str(audit), apply_mode=True,
+        action_getter=actions, reindexer=reindexer)
+    assert created == ["dataset-one", "dataset-two"]
+    assert [item["status"] for item in results] == [
+        "created_with_reindex_warning", "created"]
+    assert results[0]["processing_continued_after_warning"] is True
+    assert results[0]["errors"] == [{
+        "package_id": "dataset-one", "package_name": "dataset-one",
+        "package_type": "dataset", "error": "Solr unavailable"}]
+    assert results[1]["retained_molecule_reindex_result"][
+        "cached_reindex_reused"] is True
+    assert summary == {"requested": 2, "created": 2,
+                       "already_present": 0, "relationship_failures": 0,
+                       "reindex_warnings": 1, "completed": 2}
+    records = [json.loads(line) for line in audit.read_text().splitlines()]
+    assert records == results
+    assert all(list(record).count("identity_source") == 1
+               for record in records)
+
+
+def test_recovery_already_present_solr_failure_is_warning(monkeypatch, tmp_path):
+    manifest = recovery_manifest(tmp_path)
+    dataset = {"id": "dataset-id", "name": "dataset", "type": "dataset"}
+    keep = {"id": "keep-id", "name": "keep", "type": "molecule"}
+    checks = {"relationship": {"forward_rows": 1, "reverse_rows": 1}}
+    monkeypatch.setattr(
+        cli, "_recovery_preflight_entry",
+        lambda session, entry: (dataset, keep, keep, checks, True))
+
+    class Session(object):
+        def rollback(self):
+            pass
+
+    def failed(package, getter):
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package["type"], "status": "failed",
+                "attempts": 3, "error": "index failed",
+                "cached_reindex_reused": False}
+
+    results, summary = cli.recover_dedup_relationships(
+        Session(), manifest, 1, str(tmp_path / "audit.jsonl"),
+        apply_mode=True, action_getter=lambda name: pytest.fail(
+            "must not recreate an existing relationship"), reindexer=failed)
+    assert results[0]["status"] == "already_present_with_reindex_warning"
+    assert summary["reindex_warnings"] == 1
+
+
+def test_recovery_missing_reciprocal_row_remains_failure(monkeypatch, tmp_path):
+    manifest = recovery_manifest(tmp_path)
+    package = {"id": "id", "name": "name", "type": "dataset"}
+    checks = {"relationship": {"forward_rows": 0, "reverse_rows": 0}}
+    monkeypatch.setattr(
+        cli, "_recovery_preflight_entry",
+        lambda session, entry: (package, package, package, checks, False))
+
+    class Result(object):
+        def __init__(self, value):
+            self.value = value
+
+        def scalar(self):
+            return self.value
+
+    class Session(object):
+        def __init__(self):
+            self.counts = iter([1, 0])
+            self.rolled_back = 0
+
+        def execute(self, statement, params=None):
+            return Result(next(self.counts))
+
+        def rollback(self):
+            self.rolled_back += 1
+
+    session = Session()
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="did not create reciprocal"):
+        cli.recover_dedup_relationships(
+            session, manifest, 1, str(tmp_path / "audit.jsonl"),
+            apply_mode=True,
+            action_getter=lambda name: lambda context, data: {"ok": True},
+            reindexer=lambda package, getter: pytest.fail(
+                "relationship failure must not reindex"))
+    record = json.loads((tmp_path / "audit.jsonl").read_text())
+    assert record["status"] == "failed"
+    assert record["forward_row_count"] == 1
+    assert record["reverse_row_count"] == 0
+    assert session.rolled_back == 1
