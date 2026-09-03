@@ -91,7 +91,8 @@ def normalized_inchi_key(value):
 
 
 def _normalized_molecule_values(molecule, mol_formula=None, exact_mass=None):
-    canonical = Chem.MolToSmiles(molecule, canonical=True)
+    canonical = Chem.MolToSmiles(
+        molecule, canonical=True, isomericSmiles=True)
     normalized_inchi = rd_inchi.MolToInchi(molecule)
     normalized_key = rd_inchi.InchiToInchiKey(normalized_inchi).upper()
     exact_mass = clean_value(exact_mass)

@@ -411,9 +411,28 @@ def validate_duplicate_pair(session, inchi_key, packages):
             _package_value(package, "inchi"), expected))
         smiles_values.append(normalize_smiles_structure(
             _package_value(package, "canonical_smiles") or
-            _package_value(package, "smiles"), expected))
-    if any(item["inchi_key"] != expected for item in inchi_values + smiles_values):
-        raise MoleculeSyncError("generated InChIKey does not match CKAN InChIKey")
+            _package_value(package, "smiles")))
+    normalized_inchis = [item["inchi_code"] for item in inchi_values]
+    if normalized_inchis[0] != normalized_inchis[1]:
+        raise MoleculeSyncError(
+            "package normalized InChIs differ: {0}".format(json.dumps({
+                package["name"]: values["inchi_code"]
+                for package, values in zip(packages, inchi_values)
+            }, sort_keys=True)))
+    generated_smiles_keys = {
+        package["name"]: values["inchi_key"]
+        for package, values in zip(packages, smiles_values)
+    }
+    connectivity = expected.split("-", 1)[0]
+    mismatched_connectivity = {
+        name: key for name, key in generated_smiles_keys.items()
+        if key.split("-", 1)[0] != connectivity
+    }
+    if mismatched_connectivity:
+        raise MoleculeSyncError(
+            "SMILES connectivity block mismatch: expected {0}; generated {1}"
+            .format(connectivity,
+                    json.dumps(generated_smiles_keys, sort_keys=True)))
     calculated_formula = inchi_values[0]["calculated_formula"]
     formulas, missing = [], []
     for package, values in zip(packages, inchi_values):
@@ -428,7 +447,7 @@ def validate_duplicate_pair(session, inchi_key, packages):
                 .format(package["name"], formula, values["calculated_formula"]))
         formulas.append(formula)
     rdk_rows = session.execute(text("""
-        SELECT m.molecule_id, f.molecule_id IS NOT NULL,
+        SELECT m.molecule_id, m.inchi_code, f.molecule_id IS NOT NULL,
                f.mfp2 IS NOT NULL, f.ffp2 IS NOT NULL
         FROM rdk.molecules m LEFT JOIN rdk.fingerprints f
           ON f.molecule_id=m.molecule_id
@@ -438,17 +457,40 @@ def validate_duplicate_pair(session, inchi_key, packages):
         raise MoleculeSyncError(
             "expected exactly one matching rdk.molecules row; found {0}"
             .format(len(rdk_rows)))
-    if not all(rdk_rows[0][1:]):
+    if not all(rdk_rows[0][2:]):
         raise MoleculeSyncError("matching RDKit fingerprint is missing or null")
+    rdk_inchi = normalize_inchi_structure(rdk_rows[0][1], expected)["inchi_code"]
+    if rdk_inchi != normalized_inchis[0]:
+        raise MoleculeSyncError(
+            "RDKit normalized InChI differs from package InChI: RDKit {0}, "
+            "package {1}".format(rdk_inchi, normalized_inchis[0]))
     raw_smiles = [normalize_chemical_text(
         _package_value(item, "canonical_smiles") or _package_value(item, "smiles"))
         for item in packages]
+    stereochemistry_mismatches = [
+        {"package": package["name"], "smiles": smiles,
+         "generated_inchi_key": values["inchi_key"],
+         "classification": "smiles_stereochemistry_mismatch"}
+        for package, smiles, values in zip(packages, raw_smiles, smiles_values)
+        if values["inchi_key"] != expected
+    ]
+    corrected_smiles = inchi_values[0]["canonical_smiles"]
+    retained_smiles_update = ({
+        "package": keep["name"],
+        "field": "canonical_smiles",
+        "value": corrected_smiles,
+        "before_soft_delete": remove["name"],
+    } if stereochemistry_mismatches else None)
     titles = [normalize_chemical_text(item.get("title")) for item in packages]
     return {"inchi_key": expected, "keep_package": keep["name"],
             "remove_package": remove["name"], "references": references,
             "metadata_plan": _metadata_plan(keep, remove, expected),
             "differing_titles": titles[0] != titles[1],
             "equivalent_differing_smiles": raw_smiles[0] != raw_smiles[1],
+            "smiles_generated_inchi_keys": generated_smiles_keys,
+            "smiles_stereochemistry_mismatches": stereochemistry_mismatches,
+            "canonical_isomeric_smiles_from_inchi": corrected_smiles,
+            "retained_package_smiles_update": retained_smiles_update,
             "missing_formulas": missing, "calculated_formula": calculated_formula,
             "relationships_requiring_migration": 0}
 

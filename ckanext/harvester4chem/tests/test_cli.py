@@ -443,7 +443,8 @@ def duplicate_package(name, title="Ethanol", smiles="CCO", formula="C2H6O",
 class PairSession(object):
     def __init__(self, references=None, rdk_rows=None):
         self.references = references or {}
-        self.rdk_rows = ([(42, True, True, True)] if rdk_rows is None
+        self.rdk_rows = ([(42, "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3",
+                           True, True, True)] if rdk_rows is None
                          else rdk_rows)
         self.sql = []
 
@@ -500,6 +501,45 @@ def test_generated_inchi_key_mismatch_blocks_pair():
         validate_pair(second=bad)
 
 
+def test_smiles_stereochemistry_mismatch_is_planned_not_blocked():
+    authoritative_inchi = (
+        "InChI=1S/C3H6O3/c1-2(4)3(5)6/h2,4H,1H3,(H,5,6)/t2-/m0/s1")
+    authoritative_key = "JVTAAEKCZFNVCJ-REOHCLBHSA-N"
+    first = duplicate_package(
+        "nfdi4chem-mol100", smiles="CC(O)C(=O)O", formula="C3H6O3")
+    second = duplicate_package(
+        "nfdi4chem-mol200", smiles="O=C(O)C(O)C", formula="C3H6O3")
+    for item in (first, second):
+        for extra in item["extras"]:
+            if extra["key"] == "inchi":
+                extra["value"] = authoritative_inchi
+            elif extra["key"] == "inchi_key":
+                extra["value"] = authoritative_key
+    session = PairSession(rdk_rows=[
+        (42, authoritative_inchi, True, True, True)])
+    plan = cli.validate_duplicate_pair(
+        session, authoritative_key, [first, second])
+    assert plan["smiles_generated_inchi_keys"] == {
+        "nfdi4chem-mol100": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
+        "nfdi4chem-mol200": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
+    }
+    assert plan["smiles_stereochemistry_mismatches"] == [
+        {"package": "nfdi4chem-mol100", "smiles": "CC(O)C(=O)O",
+         "generated_inchi_key": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
+         "classification": "smiles_stereochemistry_mismatch"},
+        {"package": "nfdi4chem-mol200", "smiles": "O=C(O)C(O)C",
+         "generated_inchi_key": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
+         "classification": "smiles_stereochemistry_mismatch"},
+    ]
+    assert "@" in plan["canonical_isomeric_smiles_from_inchi"]
+    assert plan["retained_package_smiles_update"] == {
+        "package": "nfdi4chem-mol100",
+        "field": "canonical_smiles",
+        "value": plan["canonical_isomeric_smiles_from_inchi"],
+        "before_soft_delete": "nfdi4chem-mol200",
+    }
+
+
 def test_missing_formula_is_planned_for_backfill_and_complete_package_wins():
     missing = duplicate_package(
         "nfdi4chem-mol100", formula=None, created="2019-01-01")
@@ -552,9 +592,12 @@ def test_inactive_relationship_still_blocks_cleanup():
 
 @pytest.mark.parametrize("rows, reason", [
     ([], "found 0"),
-    ([(1, True, True, True), (2, True, True, True)], "found 2"),
-    ([(1, False, False, False)], "missing or null"),
-    ([(1, True, True, False)], "missing or null"),
+    ([(1, "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3", True, True, True),
+      (2, "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3", True, True, True)], "found 2"),
+    ([(1, "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3", False, False, False)],
+     "missing or null"),
+    ([(1, "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3", True, True, False)],
+     "missing or null"),
 ])
 def test_rdkit_identity_and_fingerprint_checks(rows, reason):
     with pytest.raises(molecule_sync.MoleculeSyncError, match=reason):
