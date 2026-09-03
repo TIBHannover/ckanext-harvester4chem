@@ -284,7 +284,7 @@ DUPLICATE_GROUPS_SQL = text("""
 def _load_dedup_package(session, package_id):
     row = session.execute(text("""
         SELECT id,name,title,type,state,metadata_created
-        FROM public.package WHERE id=:package_id
+        FROM public.package WHERE id=:package_id OR name=:package_id
     """), {"package_id": package_id}).fetchone()
     if not row:
         raise MoleculeSyncError("duplicate package disappeared during audit")
@@ -511,6 +511,215 @@ def _write_dedup_manifest(filename, plans):
             writer.writerow({key: plan[key] for key in writer.fieldnames})
 
 
+def parse_dedup_manifest(filename):
+    """Read and strictly validate an explicit deduplication manifest."""
+    required = ["inchi_key", "keep_package", "remove_package"]
+    entries, keys, packages = [], set(), set()
+    with open(filename, "r", newline="") as manifest:
+        reader = csv.DictReader(manifest)
+        if reader.fieldnames != required:
+            raise MoleculeSyncError(
+                "manifest columns must be exactly: {0}".format(
+                    ",".join(required)))
+        for number, row in enumerate(reader, 2):
+            if None in row or any(normalize_chemical_text(row.get(key)) is None
+                                  for key in required):
+                raise MoleculeSyncError(
+                    "malformed manifest row {0}".format(number))
+            entry = {
+                "inchi_key": normalized_inchi_key(row["inchi_key"]),
+                "keep_package": row["keep_package"].strip(),
+                "remove_package": row["remove_package"].strip(),
+            }
+            key_parts = entry["inchi_key"].split("-")
+            if (len(key_parts) != 3 or len(key_parts[0]) != 14 or
+                    len(key_parts[1]) != 10 or len(key_parts[2]) != 1 or
+                    not all(part.isalpha() for part in key_parts)):
+                raise MoleculeSyncError(
+                    "malformed manifest InChIKey on row {0}".format(number))
+            if entry["keep_package"] == entry["remove_package"]:
+                raise MoleculeSyncError(
+                    "manifest row {0} repeats one package".format(number))
+            if entry["inchi_key"] in keys:
+                raise MoleculeSyncError("duplicate manifest InChIKey: {0}".format(
+                    entry["inchi_key"]))
+            repeated = packages.intersection(
+                [entry["keep_package"], entry["remove_package"]])
+            if repeated:
+                raise MoleculeSyncError("duplicate manifest package: {0}".format(
+                    sorted(repeated)[0]))
+            keys.add(entry["inchi_key"])
+            packages.update([entry["keep_package"], entry["remove_package"]])
+            entries.append(entry)
+    return entries
+
+
+def _dedup_audit_record(entry, status, validation_result=None, error=None,
+                        metadata_changes=None, synonym_changes=None,
+                        deletion_result=None, solr_result=None):
+    return {
+        "inchi_key": entry["inchi_key"],
+        "retained_package": entry["keep_package"],
+        "removed_package": entry["remove_package"],
+        "validation_result": validation_result,
+        "metadata_changes": metadata_changes or [],
+        "synonym_changes": synonym_changes or [],
+        "ckan_deletion_result": deletion_result,
+        "solr_result": solr_result,
+        "status": status,
+        "error": error,
+    }
+
+
+def _append_dedup_audit(filename, record):
+    with open(filename, "a") as audit:
+        audit.write(json.dumps(record, sort_keys=True) + "\n")
+        audit.flush()
+
+
+def _dedup_synonym_exists(session, molecule_id, name):
+    return bool(session.execute(text("""
+        SELECT name_id FROM rdk.molecule_names
+        WHERE molecule_id=:molecule_id AND lower(name)=lower(:name) LIMIT 1
+    """), {"molecule_id": molecule_id, "name": name}).fetchone())
+
+
+def _dedup_preflight_entry(session, entry):
+    keep = _load_dedup_package(session, entry["keep_package"])
+    remove = _load_dedup_package(session, entry["remove_package"])
+    if keep["type"] != "molecule" or remove["type"] != "molecule":
+        raise MoleculeSyncError("manifest package type is not molecule")
+    active = keep["state"] == "active" and remove["state"] == "active"
+    already = keep["state"] == "active" and remove["state"] == "deleted"
+    if not active and not already:
+        raise MoleculeSyncError(
+            "manifest packages must be active or an already-applied pair")
+    plan = validate_duplicate_pair(
+        session, entry["inchi_key"], [keep, remove])
+    if active and (plan["keep_package"] != entry["keep_package"] or
+                   plan["remove_package"] != entry["remove_package"]):
+        raise MoleculeSyncError("manifest retained/removed selection was tampered")
+    plan["already_applied_candidate"] = already
+    return keep, remove, plan
+
+
+def _dedup_metadata_changes(keep, plan):
+    changes = {}
+    if plan.get("planned_smiles_replacement"):
+        corrected = plan["corrected_canonical_isomeric_smiles"]
+        for field in ("smiles", "canonical_smiles"):
+            if normalize_chemical_text(_package_value(keep, field)) != corrected:
+                changes[field] = corrected
+    formula = normalize_chemical_text(
+        _package_value(keep, "mol_formula") or
+        _package_value(keep, "molecular_formula"))
+    if formula is None:
+        changes["mol_formula"] = plan["calculated_formula"]
+    return changes
+
+
+def _dedup_synonym(keep, remove, expected_key):
+    keep_title = normalize_chemical_text(keep.get("title"))
+    title = normalize_chemical_text(remove.get("title"))
+    if (not title or title.casefold() == (keep_title or "").casefold() or
+            title.upper() == expected_key or
+            TECHNICAL_MOLECULE_NAME.match(title)):
+        return None
+    return title
+
+
+def apply_dedup_manifest(session, manifest, expected_pairs, audit_log,
+                         action_getter=None):
+    """Preflight every explicit pair, then apply resumable CKAN mutations."""
+    entries = parse_dedup_manifest(manifest)
+    if expected_pairs != len(entries):
+        raise MoleculeSyncError(
+            "expected-pairs {0} does not match manifest entry count {1}".format(
+                expected_pairs, len(entries)))
+    action_getter = action_getter or toolkit.get_action
+    validated, failures = [], []
+    for entry in entries:
+        try:
+            validated.append((entry,) + _dedup_preflight_entry(session, entry))
+        except Exception as error:
+            failures.append((entry, error))
+    if failures:
+        for entry, keep, remove, plan in validated:
+            _append_dedup_audit(audit_log, _dedup_audit_record(
+                entry, "preflight_validated", validation_result=plan))
+        for entry, error in failures:
+            _append_dedup_audit(audit_log, _dedup_audit_record(
+                entry, "preflight_failed", error=str(error)))
+        session.rollback()
+        raise MoleculeSyncError(
+            "manifest preflight failed; no mutations performed")
+
+    results = []
+    for entry, keep, remove, plan in validated:
+        changes = _dedup_metadata_changes(keep, plan)
+        synonym = _dedup_synonym(keep, remove, entry["inchi_key"])
+        molecule_id = session.execute(text("""
+            SELECT molecule_id FROM rdk.molecules
+            WHERE upper(btrim(inchi_key))=:inchi_key
+        """), {"inchi_key": entry["inchi_key"]}).scalar()
+        synonym_exists = synonym and _dedup_synonym_exists(
+            session, molecule_id, synonym)
+        if plan["already_applied_candidate"]:
+            if changes or (synonym and not synonym_exists):
+                error = "already-applied pair has incomplete retained metadata"
+                record = _dedup_audit_record(
+                    entry, "failed", validation_result=plan, error=error)
+                _append_dedup_audit(audit_log, record)
+                raise MoleculeSyncError(error)
+            record = _dedup_audit_record(
+                entry, "already_applied", validation_result=plan,
+                deletion_result="already_deleted",
+                solr_result={"retained": "no_action_metadata_valid",
+                             "removed": "already_removed"})
+            _append_dedup_audit(audit_log, record)
+            results.append(record)
+            continue
+        metadata_changes, synonym_changes = [], []
+        try:
+            payload = {"id": keep["id"]}
+            payload.update(changes)
+            action_getter("package_patch")(
+                {"model": model, "session": session,
+                 "ignore_auth": True, "user": "harvest"}, payload)
+            metadata_changes = sorted(changes)
+            if synonym and not synonym_exists:
+                session.execute(text("""
+                    INSERT INTO rdk.molecule_names
+                      (molecule_id,name,type,source)
+                    VALUES (:molecule_id,:name,'harvested_name','CKAN deduplication')
+                """), {"molecule_id": molecule_id, "name": synonym})
+                session.commit()
+                synonym_changes = [synonym]
+            deletion = action_getter("package_delete")(
+                {"model": model, "session": session,
+                 "ignore_auth": True, "user": "harvest"},
+                {"id": remove["id"]})
+            record = _dedup_audit_record(
+                entry, "applied", validation_result=plan,
+                metadata_changes=metadata_changes,
+                synonym_changes=synonym_changes,
+                deletion_result=deletion or "soft_deleted",
+                solr_result={"retained": "reindexed_by_package_patch",
+                             "removed": "removed_by_package_delete"})
+            _append_dedup_audit(audit_log, record)
+            results.append(record)
+        except Exception as error:
+            session.rollback()
+            record = _dedup_audit_record(
+                entry, "failed", validation_result=plan,
+                metadata_changes=metadata_changes,
+                synonym_changes=synonym_changes, error=str(error),
+                solr_result="unknown_after_ckan_action_failure")
+            _append_dedup_audit(audit_log, record)
+            raise
+    return results
+
+
 def deduplicate_molecule_packages_dry_run(session, manifest_out):
     plans, blocked = [], []
     try:
@@ -639,11 +848,39 @@ def repair_missing_rdk_command(manifest, dry_run, apply_mode):
 
 
 @harvester4chem.command(name="deduplicate-molecule-packages")
-@click.option("--dry-run", is_flag=True, required=True,
+@click.option("--dry-run", is_flag=True,
               help="Audit and write only the CSV plan; never change CKAN.")
-@click.option("--manifest-out", type=click.Path(dir_okay=False), required=True)
-def deduplicate_molecule_packages_command(dry_run, manifest_out):
-    """Plan safe duplicate cleanup without changing the database."""
+@click.option("--apply", "apply_mode", is_flag=True,
+              help="Apply only pairs from an explicit validated manifest.")
+@click.option("--manifest-out", type=click.Path(dir_okay=False))
+@click.option("--manifest", type=click.Path(exists=True, dir_okay=False))
+@click.option("--expected-pairs", type=click.IntRange(min=0))
+@click.option("--audit-log", type=click.Path(dir_okay=False))
+@click.option("--confirm")
+def deduplicate_molecule_packages_command(dry_run, apply_mode, manifest_out,
+                                          manifest, expected_pairs, audit_log,
+                                          confirm):
+    """Audit duplicates or apply a previously generated explicit manifest."""
+    if dry_run == apply_mode:
+        raise click.UsageError(
+            "exactly one of --dry-run or --apply is required")
+    if apply_mode:
+        if not manifest or expected_pairs is None or not audit_log:
+            raise click.UsageError(
+                "--apply requires --manifest, --expected-pairs and --audit-log")
+        if confirm != "SOFT_DELETE_VALIDATED_DUPLICATES":
+            raise click.UsageError(
+                "--apply requires --confirm SOFT_DELETE_VALIDATED_DUPLICATES")
+        try:
+            results = apply_dedup_manifest(
+                model.Session, manifest, expected_pairs, audit_log)
+        except Exception as error:
+            raise click.ClickException(str(error))
+        for result in results:
+            click.echo(json.dumps(result, sort_keys=True))
+        return
+    if not manifest_out:
+        raise click.UsageError("--dry-run requires --manifest-out")
     plans, blocked, summary = deduplicate_molecule_packages_dry_run(
         model.Session, manifest_out)
     for plan in plans:

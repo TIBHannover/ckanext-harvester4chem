@@ -1,6 +1,7 @@
 import pytest
 from click.testing import CliRunner
 import copy
+import json
 
 from ckanext.harvester4chem import cli
 from ckanext.harvester4chem.cli import VERIFY_SQL
@@ -749,23 +750,223 @@ def test_warning_pair_is_in_manifest_and_summary(monkeypatch, tmp_path):
     assert ETHANOL_KEY in output.read_text()
 
 
-def test_dedup_command_exposes_no_apply_option():
+def test_dedup_apply_requires_strong_confirmation(tmp_path):
+    manifest = tmp_path / "dedup.csv"
+    manifest.write_text("inchi_key,keep_package,remove_package\n")
     result = CliRunner().invoke(
         cli.harvester4chem,
-        ["deduplicate-molecule-packages", "--apply", "--manifest-out", "x"])
+        ["deduplicate-molecule-packages", "--apply",
+         "--manifest", str(manifest), "--expected-pairs", "0",
+         "--audit-log", str(tmp_path / "audit.jsonl")])
     assert result.exit_code != 0
-    assert "No such option: --apply" in result.output
+    assert "SOFT_DELETE_VALIDATED_DUPLICATES" in result.output
 
 
 def test_dedup_sql_is_read_only_and_code_never_commits():
     source = open(cli.__file__, "r").read()
-    dedup_source = source[source.index("DUPLICATE_GROUPS_SQL"):]
+    start = source.index("def deduplicate_molecule_packages_dry_run")
+    dedup_source = source[start:source.index("@click.group", start)]
     sql = " ".join(str(cli.DUPLICATE_GROUPS_SQL).upper().split())
     assert "UPDATE " not in sql and "DELETE " not in sql and "INSERT " not in sql
     assert "SESSION.COMMIT" not in dedup_source.upper()
     assert "package_delete" not in dedup_source
     assert "package_update" not in dedup_source
     assert "package_patch" not in dedup_source
+
+
+def test_apply_manifest_rejects_duplicates_and_expected_count(tmp_path):
+    duplicate = tmp_path / "duplicate.csv"
+    duplicate.write_text(
+        "inchi_key,keep_package,remove_package\n"
+        "AAAAAAAAAAAAAA-UHFFFAOYSA-N,keep-one,remove-one\n"
+        "AAAAAAAAAAAAAA-UHFFFAOYSA-N,keep-two,remove-two\n")
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="duplicate manifest InChIKey"):
+        cli.parse_dedup_manifest(str(duplicate))
+    valid = tmp_path / "valid.csv"
+    valid.write_text(
+        "inchi_key,keep_package,remove_package\n"
+        + ETHANOL_KEY + ",keep-one,remove-one\n")
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="expected-pairs"):
+        cli.apply_dedup_manifest(None, str(valid), 2,
+                                 str(tmp_path / "audit.jsonl"))
+
+
+def test_apply_completes_preflight_before_first_mutation(monkeypatch, tmp_path):
+    manifest = tmp_path / "dedup.csv"
+    manifest.write_text(
+        "inchi_key,keep_package,remove_package\n"
+        "AAAAAAAAAAAAAA-UHFFFAOYSA-N,keep-one,remove-one\n"
+        "BBBBBBBBBBBBBB-UHFFFAOYSA-N,keep-two,remove-two\n")
+    actions = []
+
+    class Session(object):
+        def rollback(self):
+            pass
+
+    def preflight(session, entry):
+        if entry["keep_package"] == "keep-two":
+            raise molecule_sync.MoleculeSyncError("tampered")
+        return {}, {}, {}
+
+    monkeypatch.setattr(cli, "_dedup_preflight_entry", preflight)
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="no mutations"):
+        cli.apply_dedup_manifest(
+            Session(), str(manifest), 2, str(tmp_path / "audit.jsonl"),
+            action_getter=lambda name: actions.append(name))
+    assert actions == []
+    audit = [json.loads(line) for line in
+             (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert {item["status"] for item in audit} == {
+        "preflight_validated", "preflight_failed"}
+
+
+def test_apply_pair_patches_deletes_and_preserves_synonym(monkeypatch,
+                                                           tmp_path):
+    manifest = tmp_path / "dedup.csv"
+    manifest.write_text(
+        "inchi_key,keep_package,remove_package\n" + ETHANOL_KEY +
+        ",keep-one,remove-one\n")
+    keep = duplicate_package("keep-one", smiles="C(C)O", formula=None)
+    remove = duplicate_package("remove-one", title="Ethyl alcohol")
+    plan = {"status": "validated_with_warning",
+            "warning": "smiles_stereochemistry_mismatch",
+            "planned_smiles_replacement": True,
+            "corrected_canonical_isomeric_smiles": "CCO",
+            "calculated_formula": "C2H6O",
+            "already_applied_candidate": False}
+    monkeypatch.setattr(cli, "_dedup_preflight_entry",
+                        lambda session, entry: (keep, remove, plan))
+
+    class Result(object):
+        def fetchone(self):
+            return None
+
+        def scalar(self):
+            return 42
+
+    class Session(object):
+        def __init__(self):
+            self.sql = []
+            self.commits = 0
+
+        def execute(self, statement, params=None):
+            self.sql.append(str(statement))
+            return Result()
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            pass
+
+    calls = []
+
+    def actions(name):
+        def action(context, data):
+            calls.append((name, data))
+            return {"state": "deleted"} if name == "package_delete" else data
+        return action
+
+    session = Session()
+    results = cli.apply_dedup_manifest(
+        session, str(manifest), 1, str(tmp_path / "audit.jsonl"), actions)
+    assert [item[0] for item in calls] == ["package_patch", "package_delete"]
+    assert calls[0][1]["smiles"] == "CCO"
+    assert calls[0][1]["canonical_smiles"] == "CCO"
+    assert calls[0][1]["mol_formula"] == "C2H6O"
+    assert calls[1][1] == {"id": remove["id"]}
+    assert any("INSERT INTO rdk.molecule_names" in sql for sql in session.sql)
+    assert not any("DELETE" in sql.upper() for sql in session.sql)
+    assert session.commits == 1
+    assert results[0]["synonym_changes"] == ["Ethyl alcohol"]
+    assert results[0]["solr_result"]["removed"] == \
+        "removed_by_package_delete"
+
+
+def test_technical_removed_title_is_not_inserted(monkeypatch, tmp_path):
+    keep = duplicate_package("keep-one")
+    remove = duplicate_package("nfdi4chem-mol123 (Unknown Molecule)",
+                               title="nfdi4chem-mol123 (Unknown Molecule)")
+    assert cli._dedup_synonym(keep, remove, ETHANOL_KEY) is None
+
+
+def test_already_applied_entry_performs_no_writes(monkeypatch, tmp_path):
+    manifest = tmp_path / "dedup.csv"
+    manifest.write_text(
+        "inchi_key,keep_package,remove_package\n" + ETHANOL_KEY +
+        ",keep-one,remove-one\n")
+    keep = duplicate_package("keep-one")
+    remove = duplicate_package("remove-one")
+    remove["state"] = "deleted"
+    plan = {"status": "validated", "calculated_formula": "C2H6O",
+            "already_applied_candidate": True}
+    monkeypatch.setattr(cli, "_dedup_preflight_entry",
+                        lambda session, entry: (keep, remove, plan))
+
+    class Result(object):
+        def scalar(self):
+            return 42
+
+    class Session(object):
+        def execute(self, statement, params=None):
+            return Result()
+
+    actions = []
+    result = cli.apply_dedup_manifest(
+        Session(), str(manifest), 1, str(tmp_path / "audit.jsonl"),
+        lambda name: actions.append(name))
+    assert actions == []
+    assert result[0]["status"] == "already_applied"
+    assert result[0]["solr_result"]["removed"] == "already_removed"
+
+
+def test_partial_failure_is_audited_and_stops(monkeypatch, tmp_path):
+    manifest = tmp_path / "dedup.csv"
+    manifest.write_text(
+        "inchi_key,keep_package,remove_package\n"
+        "AAAAAAAAAAAAAA-UHFFFAOYSA-N,keep-one,remove-one\n"
+        "BBBBBBBBBBBBBB-UHFFFAOYSA-N,keep-two,remove-two\n")
+
+    def preflight(session, entry):
+        keep = duplicate_package(entry["keep_package"])
+        remove = duplicate_package(entry["remove_package"])
+        return keep, remove, {
+            "status": "validated", "calculated_formula": "C2H6O",
+            "already_applied_candidate": False}
+
+    monkeypatch.setattr(cli, "_dedup_preflight_entry", preflight)
+
+    class Result(object):
+        def scalar(self):
+            return 42
+
+    class Session(object):
+        def execute(self, statement, params=None):
+            return Result()
+
+        def rollback(self):
+            pass
+
+    deletions = []
+
+    def actions(name):
+        def action(context, data):
+            if name == "package_delete":
+                deletions.append(data["id"])
+                if len(deletions) == 2:
+                    raise RuntimeError("second deletion failed")
+            return {"ok": True}
+        return action
+
+    with pytest.raises(RuntimeError, match="second deletion failed"):
+        cli.apply_dedup_manifest(
+            Session(), str(manifest), 2, str(tmp_path / "audit.jsonl"), actions)
+    audit = [json.loads(line) for line in
+             (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert [item["status"] for item in audit] == ["applied", "failed"]
 
 
 def test_empty_dedup_audit_rolls_back_and_only_writes_manifest(tmp_path):
