@@ -166,12 +166,53 @@ VERIFY_SQL = {
 }
 
 
+CHEMICAL_FIELDS = frozenset((
+    "inchi", "inchi_key", "smiles", "canonical_smiles",
+    "mol_formula", "molecular_formula",
+))
+
+
+def extract_package_chemistry(package):
+    """Extract normalized chemistry from CKAN schema fields or extras."""
+    top_level = {
+        str(key).casefold(): value for key, value in package.items()
+        if str(key).casefold() in CHEMICAL_FIELDS
+    }
+    extra_values, extra_keys = {}, []
+    for extra in package.get("extras") or []:
+        key = str(extra.get("key") or "").strip().casefold()
+        if key not in CHEMICAL_FIELDS:
+            continue
+        if extra.get("state", "active") != "active":
+            continue
+        extra_keys.append(key)
+        if key not in extra_values:
+            extra_values[key] = extra.get("value")
+    values, states = {}, {}
+    for key in CHEMICAL_FIELDS:
+        candidates = []
+        if key in top_level:
+            candidates.append(top_level[key])
+        if key in extra_values:
+            candidates.append(extra_values[key])
+        normalized = [normalize_chemical_text(value) for value in candidates]
+        values[key] = next((value for value in normalized if value is not None),
+                           None)
+        states[key] = ("absent" if not candidates else
+                       "blank" if values[key] is None else "present")
+    return {"values": values, "states": states,
+            "available_chemistry_extra_keys": sorted(set(extra_keys))}
+
+
 def _package_value(package, key):
+    normalized_key = str(key).casefold()
+    if normalized_key in CHEMICAL_FIELDS:
+        return extract_package_chemistry(package)["values"][normalized_key]
     value = package.get(key)
     if value is not None:
         return value
     for extra in package.get("extras") or []:
-        if extra.get("key") == key:
+        if str(extra.get("key") or "").casefold() == normalized_key:
             return extra.get("value")
     return None
 
@@ -297,7 +338,7 @@ def _load_dedup_package(session, package_id):
         for item in session.execute(text("""
             SELECT key,value,state FROM public.package_extra
             WHERE package_id=:package_id AND state='active' ORDER BY id
-        """), {"package_id": package_id}).fetchall()
+        """), {"package_id": row[0]}).fetchall()
     ]
     package["active_dataset_relationships"] = session.execute(text("""
         SELECT count(*) FROM public.package_relationship r
@@ -306,8 +347,20 @@ def _load_dedup_package(session, package_id):
           OR (r.object_package_id=:package_id AND other.id=r.subject_package_id)
         WHERE r.state='active' AND other.state='active'
           AND other.type<>'molecule'
-    """), {"package_id": package_id}).scalar()
+    """), {"package_id": row[0]}).scalar()
     return package
+
+
+def _package_structure_error(package, field, state, stage, error=None):
+    chemistry = extract_package_chemistry(package)
+    message = ("package {0}: {1} is {2}; validation_stage={3}; "
+               "available_chemistry_extra_keys={4}".format(
+                   package.get("name") or package.get("id"), field, state,
+                   stage,
+                   json.dumps(chemistry["available_chemistry_extra_keys"])))
+    if error is not None:
+        message += "; parser_error={0}".format(error)
+    return MoleculeSyncError(message)
 
 
 def _is_meaningful_title(package, inchi_key):
@@ -405,10 +458,20 @@ def validate_duplicate_pair(session, inchi_key, packages):
     if any(sum(item.values()) for item in references.values()):
         raise MoleculeSyncError("package reference blocks cleanup: {0}".format(
             json.dumps(references, sort_keys=True)))
+    chemistry = [extract_package_chemistry(package) for package in packages]
     inchi_values = []
-    for package in packages:
-        inchi_values.append(normalize_inchi_structure(
-            _package_value(package, "inchi"), expected))
+    for package, extracted in zip(packages, chemistry):
+        raw_inchi = extracted["values"]["inchi"]
+        if raw_inchi is None:
+            raise _package_structure_error(
+                package, "InChI", extracted["states"]["inchi"],
+                "package_inchi_extraction")
+        try:
+            inchi_values.append(normalize_inchi_structure(raw_inchi, expected))
+        except MoleculeSyncError as error:
+            raise _package_structure_error(
+                package, "InChI", "unparsable", "package_inchi_parsing",
+                error)
     normalized_inchis = [item["inchi_code"] for item in inchi_values]
     if normalized_inchis[0] != normalized_inchis[1]:
         raise MoleculeSyncError(
@@ -447,10 +510,23 @@ def validate_duplicate_pair(session, inchi_key, packages):
         raise MoleculeSyncError(
             "RDKit normalized InChI differs from package InChI: RDKit {0}, "
             "package {1}".format(rdk_inchi, normalized_inchis[0]))
-    raw_smiles = [normalize_chemical_text(
-        _package_value(item, "canonical_smiles") or _package_value(item, "smiles"))
-        for item in packages]
-    smiles_values = [normalize_smiles_structure(item) for item in raw_smiles]
+    raw_smiles = [item["values"]["canonical_smiles"] or
+                  item["values"]["smiles"] for item in chemistry]
+    smiles_values = []
+    for package, extracted, raw_smiles_value in zip(
+            packages, chemistry, raw_smiles):
+        if raw_smiles_value is None:
+            state = (extracted["states"]["canonical_smiles"]
+                     if extracted["states"]["canonical_smiles"] != "absent"
+                     else extracted["states"]["smiles"])
+            raise _package_structure_error(
+                package, "SMILES", state, "package_smiles_extraction")
+        try:
+            smiles_values.append(normalize_smiles_structure(raw_smiles_value))
+        except MoleculeSyncError as error:
+            raise _package_structure_error(
+                package, "SMILES", "unparsable", "package_smiles_parsing",
+                error)
     generated_smiles_keys = {
         package["name"]: values["inchi_key"]
         for package, values in zip(packages, smiles_values)
@@ -584,21 +660,51 @@ def _dedup_synonym_exists(session, molecule_id, name):
     """), {"molecule_id": molecule_id, "name": name}).fetchone())
 
 
+class DedupPreflightError(MoleculeSyncError):
+    def __init__(self, message, validation_result):
+        super(DedupPreflightError, self).__init__(message)
+        self.validation_result = validation_result
+
+
 def _dedup_preflight_entry(session, entry):
-    keep = _load_dedup_package(session, entry["keep_package"])
-    remove = _load_dedup_package(session, entry["remove_package"])
-    if keep["type"] != "molecule" or remove["type"] != "molecule":
-        raise MoleculeSyncError("manifest package type is not molecule")
-    active = keep["state"] == "active" and remove["state"] == "active"
-    already = keep["state"] == "active" and remove["state"] == "deleted"
-    if not active and not already:
-        raise MoleculeSyncError(
-            "manifest packages must be active or an already-applied pair")
-    plan = validate_duplicate_pair(
-        session, entry["inchi_key"], [keep, remove])
-    if active and (plan["keep_package"] != entry["keep_package"] or
-                   plan["remove_package"] != entry["remove_package"]):
-        raise MoleculeSyncError("manifest retained/removed selection was tampered")
+    progress = {"validation_stage": "load_packages", "checks": {
+        "manifest_parsed": True, "expected_inchi_key": entry["inchi_key"]}}
+    try:
+        keep = _load_dedup_package(session, entry["keep_package"])
+        remove = _load_dedup_package(session, entry["remove_package"])
+        progress["checks"]["packages"] = {}
+        for package in (keep, remove):
+            extracted = extract_package_chemistry(package)
+            progress["checks"]["packages"][package["name"]] = {
+                "exists": True, "type": package["type"],
+                "state": package["state"],
+                "chemistry_field_states": extracted["states"],
+                "available_chemistry_extra_keys":
+                    extracted["available_chemistry_extra_keys"],
+            }
+        progress["validation_stage"] = "package_type_and_state"
+        if keep["type"] != "molecule" or remove["type"] != "molecule":
+            raise MoleculeSyncError("manifest package type is not molecule")
+        active = keep["state"] == "active" and remove["state"] == "active"
+        already = keep["state"] == "active" and remove["state"] == "deleted"
+        if not active and not already:
+            raise MoleculeSyncError(
+                "manifest packages must be active or an already-applied pair")
+        progress["checks"]["package_states_valid"] = True
+        progress["validation_stage"] = "chemical_and_reference_validation"
+        plan = validate_duplicate_pair(
+            session, entry["inchi_key"], [keep, remove])
+        progress["checks"]["chemical_and_reference_validation"] = plan
+        progress["validation_stage"] = "manifest_selection"
+        if active and (plan["keep_package"] != entry["keep_package"] or
+                       plan["remove_package"] != entry["remove_package"]):
+            raise MoleculeSyncError(
+                "manifest retained/removed selection was tampered")
+    except Exception as error:
+        if isinstance(error, DedupPreflightError):
+            raise
+        progress["error"] = str(error)
+        raise DedupPreflightError(str(error), progress)
     plan["already_applied_candidate"] = already
     return keep, remove, plan
 
@@ -649,7 +755,10 @@ def apply_dedup_manifest(session, manifest, expected_pairs, audit_log,
                 entry, "preflight_validated", validation_result=plan))
         for entry, error in failures:
             _append_dedup_audit(audit_log, _dedup_audit_record(
-                entry, "preflight_failed", error=str(error)))
+                entry, "preflight_failed",
+                validation_result=getattr(error, "validation_result", {
+                    "validation_stage": "preflight",
+                    "error": str(error)}), error=str(error)))
         session.rollback()
         raise MoleculeSyncError(
             "manifest preflight failed; no mutations performed")

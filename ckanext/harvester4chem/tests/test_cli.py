@@ -467,12 +467,145 @@ class PairSession(object):
         raise AssertionError(sql)
 
 
+def test_apply_loader_uses_resolved_uuid_for_active_extras():
+    class LoaderSession(object):
+        def __init__(self):
+            self.extra_parameter = None
+
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            if "FROM public.package WHERE" in sql:
+                return BackfillResult([(
+                    "uuid-6123", "nfdi4chem-mol6123", "Canary", "molecule",
+                    "active", "2020-01-01")])
+            if "FROM public.package_extra" in sql:
+                self.extra_parameter = params["package_id"]
+                return BackfillResult([
+                    ("inchi", '"InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3"',
+                     "active"),
+                    ("inchi_key", ETHANOL_KEY, "active"),
+                    ("smiles", "CCO", "active"),
+                ])
+            if "FROM public.package_relationship" in sql:
+                return BackfillResult([(0,)])
+            raise AssertionError(sql)
+
+    session = LoaderSession()
+    package = cli._load_dedup_package(session, "nfdi4chem-mol6123")
+    assert session.extra_parameter == "uuid-6123"
+    assert cli._package_value(package, "inchi") == \
+        "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3"
+
+
+def test_production_canary_package_show_extras_pass_apply_preflight(
+        monkeypatch):
+    expected = "AAWKCAAKYFTATH-STJFUXCQSA-N"
+    authoritative = "InChI=1S/canary"
+
+    def canary(name, created):
+        return {
+            "id": "id-" + name, "name": name, "title": "Canary molecule",
+            "type": "molecule", "state": "active",
+            "metadata_created": created, "active_dataset_relationships": 0,
+            "extras": [
+                {"key": "inchi", "value": '  "' + authoritative + '"  '},
+                {"key": "inchi_key", "value": " " + expected + " "},
+                {"key": "smiles", "value": " canary-smiles "},
+                {"key": "mol_formula", "value": "C2H6O"},
+            ],
+        }
+
+    packages = {
+        "nfdi4chem-mol6123": canary("nfdi4chem-mol6123", "2020-01-01"),
+        "nfdi4chem-mol8908": canary("nfdi4chem-mol8908", "2021-01-01"),
+    }
+
+    def fake_inchi(value, inchi_key=None, mol_formula=None, exact_mass=None):
+        assert value == authoritative and inchi_key == expected
+        return {"inchi_code": authoritative, "inchi_key": expected,
+                "canonical_smiles": "canary-smiles",
+                "calculated_formula": "C2H6O"}
+
+    def fake_smiles(value, inchi_key=None, mol_formula=None, exact_mass=None):
+        assert value == "canary-smiles"
+        return {"inchi_key": expected}
+
+    monkeypatch.setattr(cli, "normalize_inchi_structure", fake_inchi)
+    monkeypatch.setattr(cli, "normalize_smiles_structure", fake_smiles)
+    monkeypatch.setattr(
+        cli, "_load_dedup_package",
+        lambda session, name: packages[name])
+    session = PairSession(rdk_rows=[
+        (42, authoritative, True, True, True)])
+    entry = {"inchi_key": expected,
+             "keep_package": "nfdi4chem-mol6123",
+             "remove_package": "nfdi4chem-mol8908"}
+    keep, remove, plan = cli._dedup_preflight_entry(session, entry)
+    assert keep["name"] == entry["keep_package"]
+    assert remove["name"] == entry["remove_package"]
+    assert plan["status"] == "validated"
+
+
 def validate_pair(session=None, first=None, second=None):
     first = first or duplicate_package("nfdi4chem-mol100")
     second = second or duplicate_package(
         "nfdi4chem-mol200", created="2021-01-01")
     return cli.validate_duplicate_pair(
         session or PairSession(), ETHANOL_KEY, [first, second])
+
+
+def test_shared_chemistry_extractor_supports_ckan_package_shapes():
+    quoted = {
+        "name": "nfdi4chem-mol6123",
+        "extras": [
+            {"key": "InChI", "value":
+             '  "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3"  '},
+            {"key": "INCHI_KEY", "value": "  " + ETHANOL_KEY + "  "},
+            {"key": "smiles", "value": " CCO "},
+        ],
+    }
+    extracted = cli.extract_package_chemistry(quoted)
+    assert extracted["values"]["inchi"] == \
+        "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3"
+    assert extracted["values"]["inchi_key"] == ETHANOL_KEY
+    assert extracted["values"]["smiles"] == "CCO"
+    assert extracted["available_chemistry_extra_keys"] == [
+        "inchi", "inchi_key", "smiles"]
+
+    top_level = {"InChI": "  InChI=1S/example  ",
+                 "canonical_smiles": " CCO ", "extras": []}
+    top = cli.extract_package_chemistry(top_level)
+    assert top["values"]["inchi"] == "InChI=1S/example"
+    assert top["values"]["canonical_smiles"] == "CCO"
+
+
+@pytest.mark.parametrize("value,state", [(None, "absent"), ("   ", "blank")])
+def test_inchi_failure_reports_package_state_keys_and_stage(value, state):
+    bad = duplicate_package("nfdi4chem-mol6123")
+    bad["extras"] = [extra for extra in bad["extras"]
+                     if extra["key"] != "inchi"]
+    if value is not None:
+        bad["extras"].append({"key": "inchi", "value": value})
+    with pytest.raises(molecule_sync.MoleculeSyncError) as raised:
+        validate_pair(first=bad)
+    message = str(raised.value)
+    assert "nfdi4chem-mol6123" in message
+    assert "InChI is " + state in message
+    assert "validation_stage=package_inchi_extraction" in message
+    assert "inchi_key" in message
+
+
+def test_invalid_inchi_reports_unparsable_and_stage():
+    bad = duplicate_package("nfdi4chem-mol6123")
+    for extra in bad["extras"]:
+        if extra["key"] == "inchi":
+            extra["value"] = "not-an-inchi"
+    with pytest.raises(molecule_sync.MoleculeSyncError) as raised:
+        validate_pair(first=bad)
+    message = str(raised.value)
+    assert "nfdi4chem-mol6123" in message
+    assert "InChI is unparsable" in message
+    assert "validation_stage=package_inchi_parsing" in message
 
 
 def test_identical_duplicate_pair_validates_and_selects_oldest():
@@ -821,6 +954,10 @@ def test_apply_completes_preflight_before_first_mutation(monkeypatch, tmp_path):
              (tmp_path / "audit.jsonl").read_text().splitlines()]
     assert {item["status"] for item in audit} == {
         "preflight_validated", "preflight_failed"}
+    failed = next(item for item in audit
+                  if item["status"] == "preflight_failed")
+    assert failed["validation_result"] is not None
+    assert failed["validation_result"]["validation_stage"] == "preflight"
 
 
 def test_apply_pair_patches_deletes_and_preserves_synonym(monkeypatch,
