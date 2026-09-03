@@ -1311,6 +1311,211 @@ def recover_dedup_relationships(session, manifest, expected_relationships,
     return results, summary
 
 
+CLEANUP_RELATIONSHIP_MANIFEST_FIELDS = [
+    "dataset_id", "dataset_name", "molecule_id", "molecule_name",
+    "relation_type",
+]
+
+
+def parse_inactive_relationship_manifest(filename):
+    entries, logical = [], set()
+    with open(filename, "r", newline="") as manifest:
+        reader = csv.DictReader(manifest)
+        if reader.fieldnames != CLEANUP_RELATIONSHIP_MANIFEST_FIELDS:
+            raise MoleculeSyncError(
+                "cleanup manifest columns must be exactly: {0}".format(
+                    ",".join(CLEANUP_RELATIONSHIP_MANIFEST_FIELDS)))
+        for number, raw in enumerate(reader, 2):
+            if None in raw or any(normalize_chemical_text(raw.get(field)) is None
+                                  for field in
+                                  CLEANUP_RELATIONSHIP_MANIFEST_FIELDS):
+                raise MoleculeSyncError(
+                    "malformed cleanup manifest row {0}".format(number))
+            entry = {field: raw[field].strip()
+                     for field in CLEANUP_RELATIONSHIP_MANIFEST_FIELDS}
+            if entry["relation_type"] != "related_to":
+                raise MoleculeSyncError(
+                    "unexpected cleanup relation type on row {0}".format(
+                        number))
+            pair = (entry["dataset_id"], entry["molecule_id"],
+                    entry["relation_type"])
+            if pair in logical:
+                raise MoleculeSyncError(
+                    "duplicate logical cleanup pair on row {0}".format(number))
+            logical.add(pair)
+            entries.append(entry)
+    return entries
+
+
+def _cleanup_preflight_entry(session, entry, package_loader=None):
+    package_loader = package_loader or _load_dedup_package
+    result = {"dataset": None, "molecule": None,
+              "forward_rows_before": None, "reverse_rows_before": None,
+              "already_deleted": False}
+
+    def fail(message):
+        raise DedupPreflightError(message, result)
+
+    try:
+        dataset_by_id = package_loader(session, entry["dataset_id"])
+        dataset_by_name = package_loader(session, entry["dataset_name"])
+        if (dataset_by_id["id"] != dataset_by_name["id"] or
+                dataset_by_id["id"] != entry["dataset_id"] or
+                dataset_by_id["name"] != entry["dataset_name"]):
+            fail("dataset ID and name do not resolve to the same package")
+        result["dataset"] = {
+            "id": dataset_by_id["id"], "name": dataset_by_id["name"],
+            "type": dataset_by_id["type"], "state": dataset_by_id["state"]}
+        if dataset_by_id["type"] == "molecule":
+            fail("cleanup dataset must not have type=molecule")
+        if dataset_by_id["state"] != "deleted":
+            fail("cleanup dataset must be deleted")
+
+        molecule_by_id = package_loader(session, entry["molecule_id"])
+        molecule_by_name = package_loader(session, entry["molecule_name"])
+        if (molecule_by_id["id"] != molecule_by_name["id"] or
+                molecule_by_id["id"] != entry["molecule_id"] or
+                molecule_by_id["name"] != entry["molecule_name"]):
+            fail("molecule ID and name do not resolve to the same package")
+        result["molecule"] = {
+            "id": molecule_by_id["id"], "name": molecule_by_id["name"],
+            "type": molecule_by_id["type"], "state": molecule_by_id["state"]}
+        if molecule_by_id["type"] != "molecule":
+            fail("cleanup molecule must have type=molecule")
+        if molecule_by_id["state"] != "active":
+            fail("cleanup molecule must be active")
+
+        forward = _relationship_count(
+            session, dataset_by_id, molecule_by_id, entry["relation_type"])
+        reverse = _relationship_count(
+            session, molecule_by_id, dataset_by_id, entry["relation_type"])
+        result["forward_rows_before"] = forward
+        result["reverse_rows_before"] = reverse
+        if forward == 0 and reverse == 0:
+            result["already_deleted"] = True
+        elif forward != 1 or reverse != 1:
+            fail("cleanup relationship must have exactly one reciprocal row "
+                 "in each direction")
+        return dataset_by_id, molecule_by_id, result
+    except DedupPreflightError:
+        raise
+    except Exception as error:
+        fail(str(error))
+
+
+def _cleanup_relationship_audit(entry, status, preflight=None,
+                                deletion=None, after=None, reindex=None,
+                                error=None):
+    before = preflight or {}
+    after = after or {}
+    return {
+        "dataset_id": entry["dataset_id"],
+        "dataset_name": entry["dataset_name"],
+        "molecule_id": entry["molecule_id"],
+        "molecule_name": entry["molecule_name"],
+        "relation_type": entry["relation_type"],
+        "preflight_result": preflight,
+        "deletion_action_result": deletion,
+        "forward_rows_before": before.get("forward_rows_before"),
+        "reverse_rows_before": before.get("reverse_rows_before"),
+        "forward_rows_after": after.get("forward_rows_after"),
+        "reverse_rows_after": after.get("reverse_rows_after"),
+        "molecule_reindex_result": reindex,
+        "status": status,
+        "error": error,
+    }
+
+
+def cleanup_inactive_relationships(session, manifest, expected_relationships,
+                                   audit_log, apply_mode=False,
+                                   action_getter=None, reindexer=None,
+                                   package_loader=None):
+    entries = parse_inactive_relationship_manifest(manifest)
+    if len(entries) != expected_relationships:
+        raise MoleculeSyncError(
+            "expected-relationships {0} does not match manifest entry count {1}"
+            .format(expected_relationships, len(entries)))
+    action_getter = action_getter or toolkit.get_action
+    reindexer = reindexer or _reindex_recovery_package
+    validated, failures = [], []
+    for entry in entries:
+        try:
+            validated.append((entry,) + _cleanup_preflight_entry(
+                session, entry, package_loader=package_loader))
+        except Exception as error:
+            failures.append((entry, error))
+    if failures:
+        for entry, dataset, molecule, preflight in validated:
+            _append_relationship_audit(audit_log, _cleanup_relationship_audit(
+                entry, "validated", preflight=preflight))
+        for entry, error in failures:
+            _append_relationship_audit(audit_log, _cleanup_relationship_audit(
+                entry, "failed",
+                preflight=getattr(error, "validation_result", None),
+                error=str(error)))
+        session.rollback()
+        raise MoleculeSyncError(
+            "inactive relationship cleanup preflight failed; "
+            "no mutations performed")
+
+    if not apply_mode:
+        results = []
+        for entry, dataset, molecule, preflight in validated:
+            record = _cleanup_relationship_audit(
+                entry, "validated", preflight=preflight)
+            _append_relationship_audit(audit_log, record)
+            results.append(record)
+        session.rollback()
+        return results
+
+    results = []
+    for entry, dataset, molecule, preflight in validated:
+        if preflight["already_deleted"]:
+            record = _cleanup_relationship_audit(
+                entry, "already_deleted", preflight=preflight,
+                after={"forward_rows_after": 0, "reverse_rows_after": 0})
+            _append_relationship_audit(audit_log, record)
+            results.append(record)
+            continue
+        deletion, after = None, None
+        try:
+            deletion = action_getter("relationship_relation_delete")(
+                {"model": model, "session": session,
+                 "ignore_auth": True, "user": "harvest"},
+                {"subject_id": dataset["id"],
+                 "object_id": molecule["id"],
+                 "relation_type": entry["relation_type"]})
+            forward = _relationship_count(
+                session, dataset, molecule, entry["relation_type"])
+            reverse = _relationship_count(
+                session, molecule, dataset, entry["relation_type"])
+            after = {"forward_rows_after": forward,
+                     "reverse_rows_after": reverse}
+            if forward != 0 or reverse != 0:
+                raise MoleculeSyncError(
+                    "relationship action did not delete both reciprocal rows")
+        except Exception as error:
+            session.rollback()
+            record = _cleanup_relationship_audit(
+                entry, "failed", preflight=preflight, deletion=deletion,
+                after=after, error=str(error))
+            _append_relationship_audit(audit_log, record)
+            raise
+
+        try:
+            reindex = reindexer(molecule, action_getter)
+        except Exception as error:
+            reindex = _failed_reindex_result(molecule, error)
+        warning = reindex["status"] == "failed"
+        record = _cleanup_relationship_audit(
+            entry, "deleted_with_reindex_warning" if warning else "deleted",
+            preflight=preflight, deletion=deletion, after=after,
+            reindex=reindex, error=reindex.get("error") if warning else None)
+        _append_relationship_audit(audit_log, record)
+        results.append(record)
+    return results
+
+
 @click.group(name="harvester4chem")
 def harvester4chem():
     """Safely synchronize harvested chemistry with PostgreSQL RDKit."""
@@ -1464,6 +1669,35 @@ def recover_dedup_relationships_command(dry_run, apply_mode, manifest,
         click.echo(json.dumps(result, sort_keys=True)
                    if isinstance(result, dict) else result)
     click.echo(json.dumps(summary, sort_keys=True))
+
+
+@harvester4chem.command(name="cleanup-inactive-relationships")
+@click.option("--dry-run", is_flag=True)
+@click.option("--apply", "apply_mode", is_flag=True)
+@click.option("--manifest", type=click.Path(exists=True, dir_okay=False),
+              required=True)
+@click.option("--expected-relationships", type=click.IntRange(min=0),
+              required=True)
+@click.option("--audit-log", type=click.Path(dir_okay=False), required=True)
+@click.option("--confirm")
+def cleanup_inactive_relationships_command(dry_run, apply_mode, manifest,
+                                           expected_relationships, audit_log,
+                                           confirm):
+    """Delete manifested relationships belonging to deleted datasets."""
+    if dry_run == apply_mode:
+        raise click.UsageError(
+            "exactly one of --dry-run or --apply is required")
+    if apply_mode and confirm != "DELETE_STALE_RELATIONSHIPS":
+        raise click.UsageError(
+            "--apply requires --confirm DELETE_STALE_RELATIONSHIPS")
+    try:
+        results = cleanup_inactive_relationships(
+            model.Session, manifest, expected_relationships, audit_log,
+            apply_mode=apply_mode)
+    except Exception as error:
+        raise click.ClickException(str(error))
+    for result in results:
+        click.echo(json.dumps(result, sort_keys=True))
 
 
 def get_commands():

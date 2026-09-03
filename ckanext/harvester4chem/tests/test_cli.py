@@ -1647,3 +1647,260 @@ def test_recovery_missing_reciprocal_row_remains_failure(monkeypatch, tmp_path):
     assert record["forward_row_count"] == 1
     assert record["reverse_row_count"] == 0
     assert session.rolled_back == 1
+
+
+def cleanup_manifest(tmp_path, rows=None):
+    output = tmp_path / "cleanup.csv"
+    output.write_text(
+        "dataset_id,dataset_name,molecule_id,molecule_name,relation_type\n" +
+        (rows or "dataset-id,dataset-name,molecule-id,molecule-name,related_to\n"))
+    return str(output)
+
+
+def cleanup_packages():
+    dataset = {"id": "dataset-id", "name": "dataset-name",
+               "type": "dataset", "state": "deleted"}
+    molecule = {"id": "molecule-id", "name": "molecule-name",
+                "type": "molecule", "state": "active"}
+    return {value: package for package in (dataset, molecule)
+            for value in (package["id"], package["name"])}
+
+
+class CleanupSession(object):
+    def __init__(self, counts):
+        self.counts = iter(counts)
+        self.sql = []
+        self.rolled_back = 0
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        self.sql.append(sql)
+
+        class Result(object):
+            def __init__(self, value):
+                self.value = value
+
+            def scalar(self):
+                return self.value
+
+        return Result(next(self.counts))
+
+    def rollback(self):
+        self.rolled_back += 1
+
+
+def test_cleanup_manifest_and_dry_run_are_read_only(tmp_path):
+    manifest = cleanup_manifest(tmp_path)
+    packages = cleanup_packages()
+    session = CleanupSession([1, 1])
+    actions = []
+    results = cli.cleanup_inactive_relationships(
+        session, manifest, 1, str(tmp_path / "audit.jsonl"),
+        package_loader=lambda unused, value: packages[value],
+        action_getter=lambda name: actions.append(name))
+    assert actions == []
+    assert session.rolled_back == 1
+    assert results[0]["status"] == "validated"
+    assert results[0]["forward_rows_before"] == 1
+    assert results[0]["reverse_rows_before"] == 1
+
+
+def test_cleanup_complete_preflight_precedes_delete(tmp_path):
+    manifest = cleanup_manifest(
+        tmp_path,
+        "dataset-id,dataset-name,molecule-id,molecule-name,related_to\n"
+        "dataset-two,dataset-two-name,molecule-two,molecule-two-name,related_to\n")
+    packages = cleanup_packages()
+    packages.update({
+        "dataset-two": {"id": "dataset-two", "name": "dataset-two-name",
+                        "type": "dataset", "state": "active"},
+        "dataset-two-name": {"id": "dataset-two", "name": "dataset-two-name",
+                             "type": "dataset", "state": "active"},
+    })
+    actions = []
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="preflight failed"):
+        cli.cleanup_inactive_relationships(
+            CleanupSession([1, 1]), manifest, 2,
+            str(tmp_path / "audit.jsonl"), apply_mode=True,
+            package_loader=lambda unused, value: packages[value],
+            action_getter=lambda name: actions.append(name))
+    assert actions == []
+
+
+def test_cleanup_apply_deletes_reciprocal_only_and_reindexes_molecule(tmp_path):
+    manifest = cleanup_manifest(tmp_path)
+    packages = cleanup_packages()
+    session = CleanupSession([1, 1, 0, 0])
+    actions, indexed = [], []
+
+    def getter(name):
+        assert name == "relationship_relation_delete"
+
+        def delete(context, data):
+            actions.append((name, data))
+            return {"deleted": True}
+        return delete
+
+    def reindexer(package, action_getter):
+        indexed.append(package)
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package["type"], "status": "reindexed",
+                "attempts": 1, "error": None,
+                "cached_reindex_reused": False}
+
+    results = cli.cleanup_inactive_relationships(
+        session, manifest, 1, str(tmp_path / "audit.jsonl"), apply_mode=True,
+        action_getter=getter, reindexer=reindexer,
+        package_loader=lambda unused, value: packages[value])
+    assert actions == [("relationship_relation_delete", {
+        "subject_id": "dataset-id", "object_id": "molecule-id",
+        "relation_type": "related_to"})]
+    assert indexed == [packages["molecule-id"]]
+    assert results[0]["status"] == "deleted"
+    assert results[0]["forward_rows_after"] == 0
+    assert results[0]["reverse_rows_after"] == 0
+    assert all("DELETE" not in sql.upper() for sql in session.sql)
+
+
+def test_cleanup_already_deleted_rerun_is_idempotent(tmp_path):
+    manifest = cleanup_manifest(tmp_path)
+    packages = cleanup_packages()
+    calls = []
+    results = cli.cleanup_inactive_relationships(
+        CleanupSession([0, 0]), manifest, 1,
+        str(tmp_path / "audit.jsonl"), apply_mode=True,
+        package_loader=lambda unused, value: packages[value],
+        action_getter=lambda name: calls.append(name),
+        reindexer=lambda package, getter: calls.append("reindex"))
+    assert calls == []
+    assert results[0]["status"] == "already_deleted"
+
+
+def test_cleanup_reciprocal_verification_failure_is_real_failure(tmp_path):
+    manifest = cleanup_manifest(tmp_path)
+    packages = cleanup_packages()
+    session = CleanupSession([1, 1, 0, 1])
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="did not delete both reciprocal"):
+        cli.cleanup_inactive_relationships(
+            session, manifest, 1, str(tmp_path / "audit.jsonl"),
+            apply_mode=True,
+            package_loader=lambda unused, value: packages[value],
+            action_getter=lambda name: lambda context, data: {
+                "deleted": True},
+            reindexer=lambda package, getter: pytest.fail(
+                "failed relationship verification must not reindex"))
+    record = json.loads((tmp_path / "audit.jsonl").read_text())
+    assert record["status"] == "failed"
+    assert record["forward_rows_after"] == 0
+    assert record["reverse_rows_after"] == 1
+    assert session.rolled_back == 1
+
+
+def test_cleanup_reuses_three_attempt_solr_retry(tmp_path):
+    manifest = cleanup_manifest(tmp_path)
+    packages = cleanup_packages()
+    attempts, shown, sleeps = [], [], []
+
+    def action_getter(name):
+        if name == "relationship_relation_delete":
+            return lambda context, data: {"deleted": True}
+        assert name == "package_show"
+
+        def show(context, data):
+            shown.append(data["id"])
+            return dict(packages[data["id"]])
+        return show
+
+    class Index(object):
+        def index_package(self, package):
+            attempts.append(package["id"])
+            if len(attempts) < 3:
+                raise RuntimeError("temporary Solr failure")
+
+    def reindexer(package, getter):
+        return cli._reindex_recovery_package(
+            package, getter, index_factory=Index, sleep=sleeps.append,
+            retry_delay=0.2)
+
+    results = cli.cleanup_inactive_relationships(
+        CleanupSession([1, 1, 0, 0]), manifest, 1,
+        str(tmp_path / "audit.jsonl"), apply_mode=True,
+        action_getter=action_getter, reindexer=reindexer,
+        package_loader=lambda unused, value: packages[value])
+    assert results[0]["status"] == "deleted"
+    assert results[0]["molecule_reindex_result"]["attempts"] == 3
+    assert shown == ["molecule-id"] * 3
+    assert sleeps == [0.2, 0.2]
+
+
+def test_cleanup_solr_warning_continues_to_next_relationship(tmp_path):
+    rows = (
+        "dataset-id,dataset-name,molecule-id,molecule-name,related_to\n"
+        "dataset-two,dataset-two-name,molecule-two,molecule-two-name,related_to\n")
+    manifest = cleanup_manifest(tmp_path, rows)
+    packages = cleanup_packages()
+    for package in (
+            {"id": "dataset-two", "name": "dataset-two-name",
+             "type": "dataset", "state": "deleted"},
+            {"id": "molecule-two", "name": "molecule-two-name",
+             "type": "molecule", "state": "active"}):
+        packages[package["id"]] = package
+        packages[package["name"]] = package
+    deleted = []
+
+    def getter(name):
+        def delete(context, data):
+            deleted.append(data["subject_id"])
+            return {"deleted": True}
+        return delete
+
+    def reindexer(package, unused):
+        failed = package["id"] == "molecule-id"
+        return {"package_id": package["id"], "package_name": package["name"],
+                "package_type": package["type"],
+                "status": "failed" if failed else "reindexed",
+                "attempts": 3 if failed else 1,
+                "error": "Solr unavailable" if failed else None,
+                "cached_reindex_reused": False}
+
+    results = cli.cleanup_inactive_relationships(
+        CleanupSession([1, 1, 1, 1, 0, 0, 0, 0]), manifest, 2,
+        str(tmp_path / "audit.jsonl"), apply_mode=True,
+        action_getter=getter, reindexer=reindexer,
+        package_loader=lambda unused, value: packages[value])
+    assert deleted == ["dataset-id", "dataset-two"]
+    assert [item["status"] for item in results] == [
+        "deleted_with_reindex_warning", "deleted"]
+    assert results[0]["error"] == "Solr unavailable"
+
+
+def test_cleanup_rejects_bad_manifest_and_duplicate_pairs(tmp_path):
+    malformed = tmp_path / "bad.csv"
+    malformed.write_text("dataset_id,dataset_name\nid,name\n")
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="columns must be exactly"):
+        cli.parse_inactive_relationship_manifest(str(malformed))
+    duplicate = cleanup_manifest(
+        tmp_path,
+        "dataset-id,dataset-name,molecule-id,molecule-name,related_to\n"
+        "dataset-id,other-name,molecule-id,other-molecule,related_to\n")
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="duplicate logical"):
+        cli.parse_inactive_relationship_manifest(duplicate)
+
+
+def test_cleanup_cli_requires_mode_and_confirmation(tmp_path):
+    manifest = cleanup_manifest(tmp_path)
+    common = ["--manifest", manifest, "--expected-relationships", "1",
+              "--audit-log", str(tmp_path / "audit.jsonl")]
+    missing_mode = CliRunner().invoke(
+        cli.harvester4chem, ["cleanup-inactive-relationships"] + common)
+    assert missing_mode.exit_code != 0
+    assert "exactly one" in missing_mode.output
+    missing_confirmation = CliRunner().invoke(
+        cli.harvester4chem,
+        ["cleanup-inactive-relationships", "--apply"] + common)
+    assert missing_confirmation.exit_code != 0
+    assert "DELETE_STALE_RELATIONSHIPS" in missing_confirmation.output
