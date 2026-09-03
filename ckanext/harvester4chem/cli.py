@@ -950,31 +950,104 @@ def _relationship_count(session, subject, object_, relation_type):
              "relation_type": relation_type}).scalar() or 0)
 
 
+def _active_extra_values(package, key):
+    matched = []
+    for extra in package.get("extras") or []:
+        if (str(extra.get("key") or "").strip().casefold() == key.casefold() and
+                extra.get("state", "active") == "active"):
+            matched.append(normalize_chemical_text(extra.get("value")))
+    return matched
+
+
+def _legacy_dataset_identities(session, dataset_id):
+    rows = session.execute(text("""
+        SELECT legacy.id, legacy.inchi_key
+        FROM public.molecule_rel_data relationship
+        JOIN public.molecules legacy ON legacy.id=relationship.molecules_id
+        WHERE relationship.package_id=:dataset_id
+        ORDER BY legacy.id
+    """), {"dataset_id": dataset_id}).fetchall()
+    return [(row[0], normalized_inchi_key(row[1])) for row in rows]
+
+
+def _recovery_checks(entry):
+    return {
+        "manifest_inchi_key": entry["inchi_key"],
+        "normalized_nonblank_dataset_inchi_keys": [],
+        "dataset_inchi_key_extra_state": None,
+        "matching_legacy_molecule_ids": [],
+        "normalized_legacy_inchi_keys": [],
+        "identity_source": None,
+        "retained_molecule_inchi_key": None,
+        "removed_molecule_inchi_key": None,
+        "rdk_molecule_id": None,
+        "stages": {
+            "package_resolution": None,
+            "package_states_and_types": None,
+            "dataset_identity": None,
+            "retained_molecule_identity": None,
+            "removed_molecule_identity": None,
+            "rdk_and_fingerprint": None,
+            "relationship": None,
+        },
+    }
+
+
 def _recovery_preflight_entry(session, entry):
-    dataset = _load_dedup_package(session, entry["dataset_package"])
-    keep = _load_dedup_package(session, entry["keep_package"])
-    remove = _load_dedup_package(session, entry["remove_package"])
-    checks = {"packages_loaded": True, "package_states_and_types": False,
-              "chemistry": False, "rdk_and_fingerprint": False,
-              "relationship": None}
+    checks = _recovery_checks(entry)
+
+    def fail(message):
+        raise DedupPreflightError(message, checks)
+
+    try:
+        dataset = _load_dedup_package(session, entry["dataset_package"])
+        keep = _load_dedup_package(session, entry["keep_package"])
+        remove = _load_dedup_package(session, entry["remove_package"])
+    except Exception as error:
+        fail("package resolution failed: {0}".format(error))
+    checks["stages"]["package_resolution"] = "validated"
     if (dataset["state"] != "active" or dataset["type"] == "molecule"):
-        raise DedupPreflightError(
-            "dataset package must be active and not type=molecule", checks)
+        fail("dataset package must be active and not type=molecule")
     if keep["state"] != "active" or keep["type"] != "molecule":
-        raise DedupPreflightError(
-            "retained package must be an active molecule", checks)
+        fail("retained package must be an active molecule")
     if remove["state"] != "deleted" or remove["type"] != "molecule":
-        raise DedupPreflightError(
-            "removed package must be a deleted molecule", checks)
-    checks["package_states_and_types"] = True
+        fail("removed package must be a deleted molecule")
+    checks["stages"]["package_states_and_types"] = "validated"
     expected = entry["inchi_key"]
-    dataset_key = normalized_inchi_key(_package_value(dataset, "inchi_key"))
+
+    dataset_extra_values = _active_extra_values(dataset, "inchi_key")
+    dataset_keys = sorted(set(value.upper() for value in dataset_extra_values
+                              if value is not None))
+    checks["normalized_nonblank_dataset_inchi_keys"] = dataset_keys
+    checks["dataset_inchi_key_extra_state"] = (
+        "absent" if not dataset_extra_values else
+        "blank" if not dataset_keys else "present")
+    if dataset_keys:
+        if dataset_keys != [expected]:
+            fail("nonblank dataset InChIKey conflicts with recovery manifest")
+        checks["identity_source"] = "dataset_extra"
+    else:
+        legacy = _legacy_dataset_identities(session, dataset["id"])
+        checks["normalized_legacy_inchi_keys"] = [key for molecule_id, key
+                                                   in legacy]
+        checks["matching_legacy_molecule_ids"] = [
+            molecule_id for molecule_id, key in legacy if key == expected]
+        if not checks["matching_legacy_molecule_ids"]:
+            fail("dataset has no matching legacy molecule relationship")
+        checks["identity_source"] = "legacy_relationship"
+    checks["stages"]["dataset_identity"] = "validated"
+
     keep_key = normalized_inchi_key(_package_value(keep, "inchi_key"))
-    if not dataset_key or not keep_key or dataset_key != expected or keep_key != expected:
-        raise DedupPreflightError(
-            "dataset/retained molecule InChIKey does not match recovery manifest",
-            checks)
-    checks["chemistry"] = True
+    checks["retained_molecule_inchi_key"] = keep_key
+    if keep_key != expected:
+        fail("retained molecule InChIKey does not match recovery manifest")
+    checks["stages"]["retained_molecule_identity"] = "validated"
+    remove_key = normalized_inchi_key(_package_value(remove, "inchi_key"))
+    checks["removed_molecule_inchi_key"] = remove_key
+    if remove_key != expected:
+        fail("removed molecule InChIKey does not match recovery manifest")
+    checks["stages"]["removed_molecule_identity"] = "validated"
+
     rows = session.execute(text("""
         SELECT m.molecule_id, f.molecule_id IS NOT NULL,
                f.mfp2 IS NOT NULL, f.ffp2 IS NOT NULL
@@ -983,17 +1056,16 @@ def _recovery_preflight_entry(session, entry):
         WHERE upper(btrim(m.inchi_key))=:inchi_key
     """), {"inchi_key": expected}).fetchall()
     if len(rows) != 1 or not all(rows[0][1:]):
-        raise DedupPreflightError(
-            "expected exactly one RDKit molecule with non-null fingerprint",
-            checks)
-    checks["rdk_and_fingerprint"] = True
+        fail("expected exactly one RDKit molecule with non-null fingerprint")
+    checks["rdk_molecule_id"] = rows[0][0]
+    checks["stages"]["rdk_and_fingerprint"] = "validated"
     forward = _relationship_count(
         session, dataset, keep, entry["relation_type"])
     reverse = _relationship_count(
         session, keep, dataset, entry["relation_type"])
-    checks["relationship"] = {"forward_rows": forward,
-                              "reverse_rows": reverse,
-                              "already_present": bool(forward and reverse)}
+    checks["stages"]["relationship"] = {
+        "forward_rows": forward, "reverse_rows": reverse,
+        "already_present": bool(forward and reverse)}
     if bool(forward) != bool(reverse):
         raise DedupPreflightError(
             "existing relationship is missing its reciprocal row", checks)
@@ -1003,11 +1075,28 @@ def _recovery_preflight_entry(session, entry):
 
 def _relationship_audit(entry, status, preflight=None, creation=None,
                         reciprocal=None, solr=None, error=None):
+    evidence = preflight or {}
     return {"dataset_package": entry["dataset_package"],
             "retained_molecule": entry["keep_package"],
             "removed_molecule": entry["remove_package"],
             "inchi_key": entry["inchi_key"],
+            "manifest_inchi_key": entry["inchi_key"],
             "relation_type": entry["relation_type"],
+            "normalized_nonblank_dataset_inchi_keys": evidence.get(
+                "normalized_nonblank_dataset_inchi_keys"),
+            "dataset_inchi_key_extra_state": evidence.get(
+                "dataset_inchi_key_extra_state"),
+            "matching_legacy_molecule_ids": evidence.get(
+                "matching_legacy_molecule_ids"),
+            "normalized_legacy_inchi_keys": evidence.get(
+                "normalized_legacy_inchi_keys"),
+            "identity_source": evidence.get("identity_source"),
+            "retained_molecule_inchi_key": evidence.get(
+                "retained_molecule_inchi_key"),
+            "removed_molecule_inchi_key": evidence.get(
+                "removed_molecule_inchi_key"),
+            "rdk_molecule_id": evidence.get("rdk_molecule_id"),
+            "validation_stages": evidence.get("stages"),
             "preflight_result": preflight,
             "creation_result": creation,
             "reciprocal_row_verification": reciprocal,
@@ -1072,9 +1161,11 @@ def recover_dedup_relationships(session, manifest, expected_relationships,
     results = []
     for entry, dataset, keep, remove, checks, already in validated:
         if already:
+            relationship_check = (checks.get("relationship") or
+                                  checks.get("stages", {}).get("relationship"))
             record = _relationship_audit(
                 entry, "already_present", preflight=checks,
-                reciprocal=checks["relationship"], solr="no_action")
+                reciprocal=relationship_check, solr="no_action")
             _append_relationship_audit(audit_log, record)
             results.append(record)
             continue

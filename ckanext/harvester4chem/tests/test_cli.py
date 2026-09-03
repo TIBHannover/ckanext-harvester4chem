@@ -1153,6 +1153,98 @@ def recovery_manifest(tmp_path, rows=None):
     return str(output)
 
 
+def recovery_preflight(monkeypatch, dataset_extra="absent", legacy=None,
+                       keep_key=ETHANOL_KEY, remove_key=ETHANOL_KEY,
+                       rdk_rows=None):
+    def item(name, type_, state, key):
+        extras = []
+        if key != "absent":
+            extras.append({"key": "inchi_key",
+                           "value": "" if key == "blank" else key,
+                           "state": "active"})
+        return {"id": "id-" + name, "name": name, "title": name,
+                "type": type_, "state": state, "extras": extras,
+                "metadata_created": "2020-01-01",
+                "active_dataset_relationships": 0}
+
+    packages = {
+        "dataset-one": item("dataset-one", "dataset", "active",
+                            dataset_extra),
+        "keep-one": item("keep-one", "molecule", "active", keep_key),
+        "remove-one": item("remove-one", "molecule", "deleted", remove_key),
+    }
+    monkeypatch.setattr(cli, "_load_dedup_package",
+                        lambda session, name: packages[name])
+
+    class Session(object):
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            if "FROM public.molecule_rel_data relationship" in sql:
+                return BackfillResult(legacy or [])
+            if "FROM rdk.molecules m LEFT JOIN rdk.fingerprints" in sql:
+                rows = ([(42, True, True, True)] if rdk_rows is None
+                        else rdk_rows)
+                return BackfillResult(rows)
+            if "FROM public.relationship_relationship" in sql:
+                return BackfillResult([(0,)])
+            raise AssertionError(sql)
+
+    entry = {"inchi_key": ETHANOL_KEY, "dataset_package": "dataset-one",
+             "keep_package": "keep-one", "remove_package": "remove-one",
+             "relation_type": "related_to"}
+    return cli._recovery_preflight_entry(Session(), entry)
+
+
+@pytest.mark.parametrize("dataset_extra", ["blank", "absent"])
+def test_recovery_uses_matching_legacy_when_dataset_extra_missing(
+        monkeypatch, dataset_extra):
+    result = recovery_preflight(
+        monkeypatch, dataset_extra=dataset_extra,
+        legacy=[(7, "OTHER-KEY"), (8, ' "' + ETHANOL_KEY + '" ')])
+    checks = result[3]
+    assert checks["dataset_inchi_key_extra_state"] == dataset_extra
+    assert checks["matching_legacy_molecule_ids"] == [8]
+    assert checks["identity_source"] == "legacy_relationship"
+    assert checks["rdk_molecule_id"] == 42
+
+
+def test_recovery_prefers_matching_nonblank_dataset_extra(monkeypatch):
+    checks = recovery_preflight(
+        monkeypatch, dataset_extra=ETHANOL_KEY,
+        legacy=[(8, "DIFFERENTLEGACY-UHFFFAOYSA-N")])[3]
+    assert checks["identity_source"] == "dataset_extra"
+    assert checks["matching_legacy_molecule_ids"] == []
+
+
+def test_recovery_conflicting_nonblank_extra_never_falls_back(monkeypatch):
+    with pytest.raises(cli.DedupPreflightError,
+                       match="nonblank dataset InChIKey conflicts"):
+        recovery_preflight(
+            monkeypatch, dataset_extra="AAAAAAAAAAAAAA-UHFFFAOYSA-N",
+            legacy=[(8, ETHANOL_KEY)])
+
+
+@pytest.mark.parametrize("legacy", [[], [(7, "AAAAAAAAAAAAAA-UHFFFAOYSA-N")]])
+def test_recovery_requires_matching_legacy_identity(monkeypatch, legacy):
+    with pytest.raises(cli.DedupPreflightError,
+                       match="no matching legacy"):
+        recovery_preflight(monkeypatch, dataset_extra="blank", legacy=legacy)
+
+
+def test_recovery_retained_key_and_rdkit_remain_strict(monkeypatch):
+    with pytest.raises(cli.DedupPreflightError,
+                       match="retained molecule InChIKey"):
+        recovery_preflight(
+            monkeypatch, dataset_extra=ETHANOL_KEY,
+            keep_key="AAAAAAAAAAAAAA-UHFFFAOYSA-N")
+    with pytest.raises(cli.DedupPreflightError) as raised:
+        recovery_preflight(
+            monkeypatch, dataset_extra=ETHANOL_KEY, rdk_rows=[])
+    checks = raised.value.validation_result
+    assert checks["stages"]["rdk_and_fingerprint"] is None
+    assert checks["rdk_molecule_id"] is None
+
+
 def test_dedup_reference_audit_uses_relationship_table_and_ids_or_names():
     session = PairSession({("id-nfdi4chem-mol200", "incoming"): 1})
     with pytest.raises(molecule_sync.MoleculeSyncError, match="reference blocks"):
