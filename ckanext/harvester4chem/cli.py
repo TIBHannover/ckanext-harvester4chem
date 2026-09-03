@@ -341,13 +341,10 @@ def _load_dedup_package(session, package_id):
         """), {"package_id": row[0]}).fetchall()
     ]
     package["active_dataset_relationships"] = session.execute(text("""
-        SELECT count(*) FROM public.package_relationship r
-        JOIN public.package other ON
-          (r.subject_package_id=:package_id AND other.id=r.object_package_id)
-          OR (r.object_package_id=:package_id AND other.id=r.subject_package_id)
-        WHERE r.state='active' AND other.state='active'
-          AND other.type<>'molecule'
-    """), {"package_id": row[0]}).scalar()
+        SELECT count(*) FROM public.relationship_relationship
+        WHERE subject_id IN (:package_id,:package_name)
+           OR object_id IN (:package_id,:package_name)
+    """), {"package_id": row[0], "package_name": row[1]}).scalar()
     return package
 
 
@@ -398,14 +395,15 @@ def _canonical_rank(package, inchi_key):
 
 
 def _package_references(session, package):
-    params = {"package_id": package["id"]}
+    params = {"package_id": package["id"],
+              "package_name": package["name"]}
     incoming = session.execute(text("""
-        SELECT count(*) FROM public.package_relationship
-        WHERE object_package_id=:package_id
+        SELECT count(*) FROM public.relationship_relationship
+        WHERE object_id IN (:package_id,:package_name)
     """), params).scalar()
     outgoing = session.execute(text("""
-        SELECT count(*) FROM public.package_relationship
-        WHERE subject_package_id=:package_id
+        SELECT count(*) FROM public.relationship_relationship
+        WHERE subject_id IN (:package_id,:package_name)
     """), params).scalar()
     legacy = session.execute(text("""
         SELECT count(*) FROM public.molecule_rel_data
@@ -888,6 +886,230 @@ def deduplicate_molecule_packages_dry_run(session, manifest_out):
         session.rollback()
 
 
+RECOVERY_MANIFEST_FIELDS = [
+    "inchi_key", "dataset_package", "keep_package", "remove_package",
+    "relation_type",
+]
+
+
+def parse_relationship_recovery_manifest(filename):
+    entries, rows, logical, removal_map = [], set(), set(), {}
+    with open(filename, "r", newline="") as manifest:
+        reader = csv.DictReader(manifest)
+        if reader.fieldnames != RECOVERY_MANIFEST_FIELDS:
+            raise MoleculeSyncError(
+                "recovery manifest columns must be exactly: {0}".format(
+                    ",".join(RECOVERY_MANIFEST_FIELDS)))
+        for number, raw in enumerate(reader, 2):
+            if None in raw or any(normalize_chemical_text(raw.get(field)) is None
+                                  for field in RECOVERY_MANIFEST_FIELDS):
+                raise MoleculeSyncError(
+                    "malformed recovery manifest row {0}".format(number))
+            entry = {field: raw[field].strip()
+                     for field in RECOVERY_MANIFEST_FIELDS}
+            entry["inchi_key"] = normalized_inchi_key(entry["inchi_key"])
+            key_parts = entry["inchi_key"].split("-")
+            if (len(key_parts) != 3 or len(key_parts[0]) != 14 or
+                    len(key_parts[1]) != 10 or len(key_parts[2]) != 1 or
+                    not all(part.isalpha() for part in key_parts)):
+                raise MoleculeSyncError(
+                    "malformed recovery InChIKey on row {0}".format(number))
+            if entry["relation_type"] != "related_to":
+                raise MoleculeSyncError(
+                    "unexpected recovery relation type on row {0}".format(number))
+            complete = tuple(entry[field] for field in RECOVERY_MANIFEST_FIELDS)
+            mapping = (entry["dataset_package"], entry["keep_package"],
+                       entry["relation_type"])
+            removal = (entry["inchi_key"], entry["keep_package"])
+            if complete in rows:
+                raise MoleculeSyncError(
+                    "duplicate complete recovery row {0}".format(number))
+            if mapping in logical:
+                raise MoleculeSyncError(
+                    "duplicate logical recovery mapping on row {0}".format(number))
+            previous = removal_map.get(entry["remove_package"])
+            if previous is not None and previous != removal:
+                raise MoleculeSyncError(
+                    "removal package has inconsistent deduplication mapping: {0}"
+                    .format(entry["remove_package"]))
+            rows.add(complete)
+            logical.add(mapping)
+            removal_map[entry["remove_package"]] = removal
+            entries.append(entry)
+    return entries
+
+
+def _relationship_count(session, subject, object_, relation_type):
+    return int(session.execute(text("""
+        SELECT count(*) FROM public.relationship_relationship
+        WHERE subject_id IN (:subject_id,:subject_name)
+          AND object_id IN (:object_id,:object_name)
+          AND relation_type=:relation_type
+    """), {"subject_id": subject["id"], "subject_name": subject["name"],
+             "object_id": object_["id"], "object_name": object_["name"],
+             "relation_type": relation_type}).scalar() or 0)
+
+
+def _recovery_preflight_entry(session, entry):
+    dataset = _load_dedup_package(session, entry["dataset_package"])
+    keep = _load_dedup_package(session, entry["keep_package"])
+    remove = _load_dedup_package(session, entry["remove_package"])
+    checks = {"packages_loaded": True, "package_states_and_types": False,
+              "chemistry": False, "rdk_and_fingerprint": False,
+              "relationship": None}
+    if (dataset["state"] != "active" or dataset["type"] == "molecule"):
+        raise DedupPreflightError(
+            "dataset package must be active and not type=molecule", checks)
+    if keep["state"] != "active" or keep["type"] != "molecule":
+        raise DedupPreflightError(
+            "retained package must be an active molecule", checks)
+    if remove["state"] != "deleted" or remove["type"] != "molecule":
+        raise DedupPreflightError(
+            "removed package must be a deleted molecule", checks)
+    checks["package_states_and_types"] = True
+    expected = entry["inchi_key"]
+    dataset_key = normalized_inchi_key(_package_value(dataset, "inchi_key"))
+    keep_key = normalized_inchi_key(_package_value(keep, "inchi_key"))
+    if not dataset_key or not keep_key or dataset_key != expected or keep_key != expected:
+        raise DedupPreflightError(
+            "dataset/retained molecule InChIKey does not match recovery manifest",
+            checks)
+    checks["chemistry"] = True
+    rows = session.execute(text("""
+        SELECT m.molecule_id, f.molecule_id IS NOT NULL,
+               f.mfp2 IS NOT NULL, f.ffp2 IS NOT NULL
+        FROM rdk.molecules m LEFT JOIN rdk.fingerprints f
+          ON f.molecule_id=m.molecule_id
+        WHERE upper(btrim(m.inchi_key))=:inchi_key
+    """), {"inchi_key": expected}).fetchall()
+    if len(rows) != 1 or not all(rows[0][1:]):
+        raise DedupPreflightError(
+            "expected exactly one RDKit molecule with non-null fingerprint",
+            checks)
+    checks["rdk_and_fingerprint"] = True
+    forward = _relationship_count(
+        session, dataset, keep, entry["relation_type"])
+    reverse = _relationship_count(
+        session, keep, dataset, entry["relation_type"])
+    checks["relationship"] = {"forward_rows": forward,
+                              "reverse_rows": reverse,
+                              "already_present": bool(forward and reverse)}
+    if bool(forward) != bool(reverse):
+        raise DedupPreflightError(
+            "existing relationship is missing its reciprocal row", checks)
+    already = bool(forward and reverse)
+    return dataset, keep, remove, checks, already
+
+
+def _relationship_audit(entry, status, preflight=None, creation=None,
+                        reciprocal=None, solr=None, error=None):
+    return {"dataset_package": entry["dataset_package"],
+            "retained_molecule": entry["keep_package"],
+            "removed_molecule": entry["remove_package"],
+            "inchi_key": entry["inchi_key"],
+            "relation_type": entry["relation_type"],
+            "preflight_result": preflight,
+            "creation_result": creation,
+            "reciprocal_row_verification": reciprocal,
+            "solr_reindex_result": solr,
+            "status": status, "error": error}
+
+
+def _append_relationship_audit(filename, record):
+    with open(filename, "a") as audit:
+        audit.write(json.dumps(record, sort_keys=True) + "\n")
+        audit.flush()
+
+
+def _reindex_recovery_packages(dataset, keep, action_getter):
+    from ckan.lib.search.index import PackageSearchIndex
+    index = PackageSearchIndex()
+    for package in (dataset, keep):
+        fresh = action_getter("package_show")(
+            {"ignore_auth": True}, {"id": package["id"]})
+        index.index_package(fresh)
+    return {"dataset": "reindexed", "retained_molecule": "reindexed"}
+
+
+def recover_dedup_relationships(session, manifest, expected_relationships,
+                                audit_log, apply_mode=False,
+                                action_getter=None, reindexer=None):
+    entries = parse_relationship_recovery_manifest(manifest)
+    if len(entries) != expected_relationships:
+        raise MoleculeSyncError(
+            "expected-relationships {0} does not match manifest entry count {1}"
+            .format(expected_relationships, len(entries)))
+    action_getter = action_getter or toolkit.get_action
+    reindexer = reindexer or _reindex_recovery_packages
+    validated, failures = [], []
+    for entry in entries:
+        try:
+            validated.append((entry,) +
+                             _recovery_preflight_entry(session, entry))
+        except Exception as error:
+            failures.append((entry, error))
+    if failures:
+        for item in validated:
+            _append_relationship_audit(audit_log, _relationship_audit(
+                item[0], "preflight_validated", preflight=item[4]))
+        for entry, error in failures:
+            _append_relationship_audit(audit_log, _relationship_audit(
+                entry, "preflight_failed",
+                preflight=getattr(error, "validation_result", None),
+                error=str(error)))
+        session.rollback()
+        raise MoleculeSyncError(
+            "relationship recovery preflight failed; no mutations performed")
+    if not apply_mode:
+        for entry, dataset, keep, remove, checks, already in validated:
+            status = "already_present" if already else "validated"
+            _append_relationship_audit(audit_log, _relationship_audit(
+                entry, status, preflight=checks))
+        session.rollback()
+        return ["already_present" if item[5] else "validated"
+                for item in validated]
+
+    results = []
+    for entry, dataset, keep, remove, checks, already in validated:
+        if already:
+            record = _relationship_audit(
+                entry, "already_present", preflight=checks,
+                reciprocal=checks["relationship"], solr="no_action")
+            _append_relationship_audit(audit_log, record)
+            results.append(record)
+            continue
+        try:
+            created, reciprocal, solr = None, None, None
+            created = action_getter("relationship_relation_create")(
+                {"model": model, "session": session,
+                 "ignore_auth": True, "user": "harvest"},
+                {"subject_id": dataset["id"], "object_id": keep["id"],
+                 "relation_type": entry["relation_type"]})
+            forward = _relationship_count(
+                session, dataset, keep, entry["relation_type"])
+            reverse = _relationship_count(
+                session, keep, dataset, entry["relation_type"])
+            reciprocal = {"forward_rows": forward, "reverse_rows": reverse}
+            if not forward or not reverse:
+                raise MoleculeSyncError(
+                    "relationship action did not create reciprocal rows")
+            solr = reindexer(dataset, keep, action_getter)
+            record = _relationship_audit(
+                entry, "created", preflight=checks, creation=created,
+                reciprocal=reciprocal, solr=solr)
+            _append_relationship_audit(audit_log, record)
+            results.append(record)
+        except Exception as error:
+            session.rollback()
+            record = _relationship_audit(
+                entry, "failed", preflight=checks, creation=created,
+                reciprocal=reciprocal, error=str(error),
+                solr=solr or "unknown_after_action_failure")
+            _append_relationship_audit(audit_log, record)
+            raise
+    return results
+
+
 @click.group(name="harvester4chem")
 def harvester4chem():
     """Safely synchronize harvested chemistry with PostgreSQL RDKit."""
@@ -1010,6 +1232,36 @@ def deduplicate_molecule_packages_command(dry_run, apply_mode, manifest_out,
         click.echo("{0}={1}".format(key, str(summary[key]).lower()
                                    if isinstance(summary[key], bool)
                                    else summary[key]))
+
+
+@harvester4chem.command(name="recover-dedup-relationships")
+@click.option("--dry-run", is_flag=True)
+@click.option("--apply", "apply_mode", is_flag=True)
+@click.option("--manifest", type=click.Path(exists=True, dir_okay=False),
+              required=True)
+@click.option("--expected-relationships", type=click.IntRange(min=0),
+              required=True)
+@click.option("--audit-log", type=click.Path(dir_okay=False), required=True)
+@click.option("--confirm")
+def recover_dedup_relationships_command(dry_run, apply_mode, manifest,
+                                        expected_relationships, audit_log,
+                                        confirm):
+    """Recover validated dataset-to-retained-molecule relationships."""
+    if dry_run == apply_mode:
+        raise click.UsageError(
+            "exactly one of --dry-run or --apply is required")
+    if apply_mode and confirm != "RECOVER_VALIDATED_RELATIONSHIPS":
+        raise click.UsageError(
+            "--apply requires --confirm RECOVER_VALIDATED_RELATIONSHIPS")
+    try:
+        results = recover_dedup_relationships(
+            model.Session, manifest, expected_relationships, audit_log,
+            apply_mode=apply_mode)
+    except Exception as error:
+        raise click.ClickException(str(error))
+    for result in results:
+        click.echo(json.dumps(result, sort_keys=True)
+                   if isinstance(result, dict) else result)
 
 
 def get_commands():

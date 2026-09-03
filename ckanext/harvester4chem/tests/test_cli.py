@@ -453,10 +453,12 @@ class PairSession(object):
         sql, params = " ".join(str(statement).split()), params or {}
         self.sql.append(sql)
         package_id = params.get("package_id")
-        if "object_package_id=:package_id" in sql:
+        if "FROM public.relationship_relationship" in sql and \
+                "object_id IN" in sql:
             return BackfillResult([(self.references.get(
                 (package_id, "incoming"), 0),)])
-        if "subject_package_id=:package_id" in sql:
+        if "FROM public.relationship_relationship" in sql and \
+                "subject_id IN" in sql:
             return BackfillResult([(self.references.get(
                 (package_id, "outgoing"), 0),)])
         if "FROM public.molecule_rel_data" in sql:
@@ -486,7 +488,7 @@ def test_apply_loader_uses_resolved_uuid_for_active_extras():
                     ("inchi_key", ETHANOL_KEY, "active"),
                     ("smiles", "CCO", "active"),
                 ])
-            if "FROM public.package_relationship" in sql:
+            if "FROM public.relationship_relationship" in sql:
                 return BackfillResult([(0,)])
             raise AssertionError(sql)
 
@@ -787,8 +789,9 @@ def test_inactive_relationship_still_blocks_cleanup():
     with pytest.raises(molecule_sync.MoleculeSyncError, match="reference blocks"):
         validate_pair(session=session)
     relationship_sql = [sql for sql in session.sql
-                        if "package_relationship" in sql]
-    assert all("state='active'" not in sql for sql in relationship_sql)
+                        if "relationship_relationship" in sql]
+    assert relationship_sql
+    assert all("package_relationship" not in sql for sql in relationship_sql)
 
 
 @pytest.mark.parametrize("rows, reason", [
@@ -1139,3 +1142,135 @@ def test_empty_dedup_audit_rolls_back_and_only_writes_manifest(tmp_path):
     assert session.rolled_back == 1
     assert output.read_text().strip() == \
         "inchi_key,keep_package,remove_package"
+
+
+def recovery_manifest(tmp_path, rows=None):
+    output = tmp_path / "recovery.csv"
+    output.write_text(
+        "inchi_key,dataset_package,keep_package,remove_package,relation_type\n" +
+        (rows or ETHANOL_KEY +
+         ",dataset-one,keep-one,remove-one,related_to\n"))
+    return str(output)
+
+
+def test_dedup_reference_audit_uses_relationship_table_and_ids_or_names():
+    session = PairSession({("id-nfdi4chem-mol200", "incoming"): 1})
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="reference blocks"):
+        validate_pair(session=session)
+    sql = " ".join(session.sql)
+    assert "public.relationship_relationship" in sql
+    assert "object_id IN (:package_id,:package_name)" in sql
+    assert "subject_id IN (:package_id,:package_name)" in sql
+    assert "public.package_relationship" not in sql
+
+
+def test_recovery_manifest_rejects_tampering_and_count(tmp_path):
+    duplicate = recovery_manifest(
+        tmp_path,
+        ETHANOL_KEY + ",dataset-one,keep-one,remove-one,related_to\n" +
+        ETHANOL_KEY + ",dataset-one,keep-one,remove-two,related_to\n")
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="duplicate logical"):
+        cli.parse_relationship_recovery_manifest(duplicate)
+    valid = recovery_manifest(tmp_path)
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="expected-relationships"):
+        cli.recover_dedup_relationships(
+            None, valid, 2, str(tmp_path / "audit.jsonl"))
+
+
+def test_recovery_calls_create_once_and_verifies_reciprocal_rows(
+        monkeypatch, tmp_path):
+    manifest = recovery_manifest(tmp_path)
+    dataset = {"id": "dataset-id", "name": "dataset-one"}
+    keep = {"id": "keep-id", "name": "keep-one"}
+    remove = {"id": "remove-id", "name": "remove-one"}
+    checks = {"relationship": {"forward_rows": 0, "reverse_rows": 0}}
+    monkeypatch.setattr(
+        cli, "_recovery_preflight_entry",
+        lambda session, entry: (dataset, keep, remove, checks, False))
+
+    class Result(object):
+        def scalar(self):
+            return 1
+
+    class Session(object):
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, statement, params=None):
+            self.sql.append((str(statement), params))
+            return Result()
+
+        def rollback(self):
+            pass
+
+    calls = []
+
+    def actions(name):
+        def action(context, data):
+            calls.append((name, data))
+            return [{"relation_type": "related_to"},
+                    {"relation_type": "related_to"}]
+        return action
+
+    result = cli.recover_dedup_relationships(
+        Session(), manifest, 1, str(tmp_path / "audit.jsonl"),
+        apply_mode=True, action_getter=actions,
+        reindexer=lambda dataset, keep, getter: {"both": "reindexed"})
+    assert [name for name, data in calls] == [
+        "relationship_relation_create"]
+    assert calls[0][1] == {"subject_id": "dataset-id",
+                           "object_id": "keep-id",
+                           "relation_type": "related_to"}
+    assert result[0]["reciprocal_row_verification"] == {
+        "forward_rows": 1, "reverse_rows": 1}
+    assert result[0]["status"] == "created"
+
+
+def test_recovery_already_present_is_idempotent(monkeypatch, tmp_path):
+    manifest = recovery_manifest(tmp_path)
+    package = {"id": "id", "name": "name"}
+    checks = {"relationship": {"forward_rows": 1, "reverse_rows": 1}}
+    monkeypatch.setattr(
+        cli, "_recovery_preflight_entry",
+        lambda session, entry: (package, package, package, checks, True))
+
+    class Session(object):
+        def rollback(self):
+            pass
+
+    calls = []
+    result = cli.recover_dedup_relationships(
+        Session(), manifest, 1, str(tmp_path / "audit.jsonl"),
+        apply_mode=True, action_getter=lambda name: calls.append(name),
+        reindexer=lambda *args: calls.append("reindex"))
+    assert calls == []
+    assert result[0]["status"] == "already_present"
+
+
+def test_recovery_complete_preflight_precedes_mutation(monkeypatch, tmp_path):
+    manifest = recovery_manifest(
+        tmp_path,
+        "AAAAAAAAAAAAAA-UHFFFAOYSA-N,dataset-one,keep-one,remove-one,related_to\n"
+        "BBBBBBBBBBBBBB-UHFFFAOYSA-N,dataset-two,keep-two,remove-two,related_to\n")
+    actions = []
+
+    def preflight(session, entry):
+        if entry["dataset_package"] == "dataset-two":
+            raise molecule_sync.MoleculeSyncError("inactive dataset")
+        package = {"id": "id", "name": "name"}
+        return package, package, package, {}, False
+
+    monkeypatch.setattr(cli, "_recovery_preflight_entry", preflight)
+
+    class Session(object):
+        def rollback(self):
+            pass
+
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="no mutations"):
+        cli.recover_dedup_relationships(
+            Session(), manifest, 2, str(tmp_path / "audit.jsonl"),
+            apply_mode=True, action_getter=lambda name: actions.append(name))
+    assert actions == []
