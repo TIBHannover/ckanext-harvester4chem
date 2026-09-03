@@ -405,13 +405,10 @@ def validate_duplicate_pair(session, inchi_key, packages):
     if any(sum(item.values()) for item in references.values()):
         raise MoleculeSyncError("package reference blocks cleanup: {0}".format(
             json.dumps(references, sort_keys=True)))
-    inchi_values, smiles_values = [], []
+    inchi_values = []
     for package in packages:
         inchi_values.append(normalize_inchi_structure(
             _package_value(package, "inchi"), expected))
-        smiles_values.append(normalize_smiles_structure(
-            _package_value(package, "canonical_smiles") or
-            _package_value(package, "smiles")))
     normalized_inchis = [item["inchi_code"] for item in inchi_values]
     if normalized_inchis[0] != normalized_inchis[1]:
         raise MoleculeSyncError(
@@ -419,20 +416,6 @@ def validate_duplicate_pair(session, inchi_key, packages):
                 package["name"]: values["inchi_code"]
                 for package, values in zip(packages, inchi_values)
             }, sort_keys=True)))
-    generated_smiles_keys = {
-        package["name"]: values["inchi_key"]
-        for package, values in zip(packages, smiles_values)
-    }
-    connectivity = expected.split("-", 1)[0]
-    mismatched_connectivity = {
-        name: key for name, key in generated_smiles_keys.items()
-        if key.split("-", 1)[0] != connectivity
-    }
-    if mismatched_connectivity:
-        raise MoleculeSyncError(
-            "SMILES connectivity block mismatch: expected {0}; generated {1}"
-            .format(connectivity,
-                    json.dumps(generated_smiles_keys, sort_keys=True)))
     calculated_formula = inchi_values[0]["calculated_formula"]
     formulas, missing = [], []
     for package, values in zip(packages, inchi_values):
@@ -467,6 +450,18 @@ def validate_duplicate_pair(session, inchi_key, packages):
     raw_smiles = [normalize_chemical_text(
         _package_value(item, "canonical_smiles") or _package_value(item, "smiles"))
         for item in packages]
+    smiles_values = [normalize_smiles_structure(item) for item in raw_smiles]
+    generated_smiles_keys = {
+        package["name"]: values["inchi_key"]
+        for package, values in zip(packages, smiles_values)
+    }
+    expected_connectivity = expected[:14]
+    if any(key[:14] != expected_connectivity
+           for key in generated_smiles_keys.values()):
+        raise MoleculeSyncError(
+            "SMILES connectivity block mismatch: expected {0}; generated {1}"
+            .format(expected_connectivity,
+                    json.dumps(generated_smiles_keys, sort_keys=True)))
     stereochemistry_mismatches = [
         {"package": package["name"], "smiles": smiles,
          "generated_inchi_key": values["inchi_key"],
@@ -474,25 +469,36 @@ def validate_duplicate_pair(session, inchi_key, packages):
         for package, smiles, values in zip(packages, raw_smiles, smiles_values)
         if values["inchi_key"] != expected
     ]
-    corrected_smiles = inchi_values[0]["canonical_smiles"]
-    retained_smiles_update = ({
-        "package": keep["name"],
-        "field": "canonical_smiles",
-        "value": corrected_smiles,
-        "before_soft_delete": remove["name"],
-    } if stereochemistry_mismatches else None)
     titles = [normalize_chemical_text(item.get("title")) for item in packages]
-    return {"inchi_key": expected, "keep_package": keep["name"],
+    plan = {"status": "validated", "inchi_key": expected,
+            "keep_package": keep["name"],
             "remove_package": remove["name"], "references": references,
             "metadata_plan": _metadata_plan(keep, remove, expected),
             "differing_titles": titles[0] != titles[1],
             "equivalent_differing_smiles": raw_smiles[0] != raw_smiles[1],
-            "smiles_generated_inchi_keys": generated_smiles_keys,
-            "smiles_stereochemistry_mismatches": stereochemistry_mismatches,
-            "canonical_isomeric_smiles_from_inchi": corrected_smiles,
-            "retained_package_smiles_update": retained_smiles_update,
+            "package_smiles_inchi_keys": generated_smiles_keys,
             "missing_formulas": missing, "calculated_formula": calculated_formula,
             "relationships_requiring_migration": 0}
+    if stereochemistry_mismatches:
+        corrected_smiles = inchi_values[0]["canonical_smiles"]
+        corrected_key = normalize_smiles_structure(
+            corrected_smiles)["inchi_key"]
+        if corrected_key != expected:
+            raise MoleculeSyncError(
+                "canonical isomeric SMILES generated from authoritative InChI "
+                "does not regenerate expected InChIKey: expected {0}, generated {1}"
+                .format(expected, corrected_key))
+        plan.update({
+            "status": "validated_with_warning",
+            "warning": "smiles_stereochemistry_mismatch",
+            "expected_inchi_key": expected,
+            "smiles_stereochemistry_mismatch_details":
+                stereochemistry_mismatches,
+            "corrected_canonical_isomeric_smiles": corrected_smiles,
+            "corrected_smiles_inchi_key": corrected_key,
+            "planned_smiles_replacement": True,
+        })
+    return plan
 
 
 def _write_dedup_manifest(filename, plans):
@@ -537,6 +543,12 @@ def deduplicate_molecule_packages_dry_run(session, manifest_out):
             "differing_titles": sum(int(x["differing_titles"]) for x in plans),
             "equivalent_differing_smiles": sum(
                 int(x["equivalent_differing_smiles"]) for x in plans),
+            "smiles_stereochemistry_mismatches": sum(
+                int(x.get("warning") == "smiles_stereochemistry_mismatch")
+                for x in plans),
+            "planned_smiles_replacements": sum(
+                int(x.get("planned_smiles_replacement", False))
+                for x in plans),
             "missing_formulas": sum(len(x["missing_formulas"]) for x in plans),
             "conflicting_formulas": sum(
                 int("conflicting molecular formula" in x["reason"])
@@ -635,14 +647,15 @@ def deduplicate_molecule_packages_command(dry_run, manifest_out):
     plans, blocked, summary = deduplicate_molecule_packages_dry_run(
         model.Session, manifest_out)
     for plan in plans:
-        click.echo(json.dumps({"status": "validated", **plan},
-                              sort_keys=True))
+        click.echo(json.dumps(plan, sort_keys=True))
     for item in blocked:
         click.echo(json.dumps({"status": "blocked", **item},
                               sort_keys=True))
     for key in (
             "duplicate_groups_found", "validated_pairs", "blocked_pairs",
             "differing_titles", "equivalent_differing_smiles",
+            "smiles_stereochemistry_mismatches",
+            "planned_smiles_replacements",
             "missing_formulas", "conflicting_formulas",
             "packages_to_retain", "packages_to_soft_delete",
             "relationships_requiring_migration",

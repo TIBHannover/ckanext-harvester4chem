@@ -519,11 +519,14 @@ def test_smiles_stereochemistry_mismatch_is_planned_not_blocked():
         (42, authoritative_inchi, True, True, True)])
     plan = cli.validate_duplicate_pair(
         session, authoritative_key, [first, second])
-    assert plan["smiles_generated_inchi_keys"] == {
+    assert plan["status"] == "validated_with_warning"
+    assert plan["warning"] == "smiles_stereochemistry_mismatch"
+    assert plan["expected_inchi_key"] == authoritative_key
+    assert plan["package_smiles_inchi_keys"] == {
         "nfdi4chem-mol100": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
         "nfdi4chem-mol200": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
     }
-    assert plan["smiles_stereochemistry_mismatches"] == [
+    assert plan["smiles_stereochemistry_mismatch_details"] == [
         {"package": "nfdi4chem-mol100", "smiles": "CC(O)C(=O)O",
          "generated_inchi_key": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
          "classification": "smiles_stereochemistry_mismatch"},
@@ -531,13 +534,77 @@ def test_smiles_stereochemistry_mismatch_is_planned_not_blocked():
          "generated_inchi_key": "JVTAAEKCZFNVCJ-UHFFFAOYSA-N",
          "classification": "smiles_stereochemistry_mismatch"},
     ]
-    assert "@" in plan["canonical_isomeric_smiles_from_inchi"]
-    assert plan["retained_package_smiles_update"] == {
-        "package": "nfdi4chem-mol100",
-        "field": "canonical_smiles",
-        "value": plan["canonical_isomeric_smiles_from_inchi"],
-        "before_soft_delete": "nfdi4chem-mol200",
+    assert "@" in plan["corrected_canonical_isomeric_smiles"]
+    assert plan["corrected_smiles_inchi_key"] == authoritative_key
+    assert plan["planned_smiles_replacement"] is True
+
+
+PRODUCTION_STEREOCHEMISTRY_CASES = [
+    ("AUTOLBMXDDTRRT-JGVFFNPUSA-N",
+     "AUTOLBMXDDTRRT-UHFFFAOYSA-N"),
+    ("OGDVEMNWJVYAJL-LEPYJNQMSA-N",
+     "OGDVEMNWJVYAJL-UHFFFAOYSA-N"),
+    ("PWKSKIMOESPYIA-BYPYZUCNSA-N",
+     "PWKSKIMOESPYIA-UHFFFAOYSA-N"),
+    ("UHEFGGUIARHISN-UUKMXZOPSA-N",
+     "UHEFGGUIARHISN-LYBXBRPPSA-N"),
+    ("YYJWBYNQJLBIGS-SNAWJCMRSA-N",
+     "YYJWBYNQJLBIGS-UHFFFAOYSA-N"),
+]
+
+
+@pytest.mark.parametrize("expected_key,smiles_key",
+                         PRODUCTION_STEREOCHEMISTRY_CASES)
+def test_production_stereochemistry_cases_validate_with_warning(
+        monkeypatch, expected_key, smiles_key):
+    authoritative_inchi = "InChI=1S/mock"
+    corrected_smiles = "corrected-isomeric-smiles"
+
+    def fake_inchi(value, inchi_key=None, mol_formula=None, exact_mass=None):
+        assert inchi_key == expected_key
+        return {"inchi_code": authoritative_inchi,
+                "inchi_key": expected_key,
+                "canonical_smiles": corrected_smiles,
+                "calculated_formula": "C2H6O"}
+
+    def fake_smiles(value, inchi_key=None, mol_formula=None, exact_mass=None):
+        key = expected_key if value == corrected_smiles else smiles_key
+        if inchi_key is not None and key != inchi_key:
+            raise molecule_sync.MoleculeSyncError("SMILES key mismatch")
+        return {"inchi_key": key}
+
+    monkeypatch.setattr(cli, "normalize_inchi_structure", fake_inchi)
+    monkeypatch.setattr(cli, "normalize_smiles_structure", fake_smiles)
+    first = duplicate_package("nfdi4chem-mol100", smiles="package-smiles-1")
+    second = duplicate_package("nfdi4chem-mol200", smiles="package-smiles-2")
+    session = PairSession(rdk_rows=[
+        (42, authoritative_inchi, True, True, True)])
+    plan = cli.validate_duplicate_pair(
+        session, expected_key, [first, second])
+    assert plan["status"] == "validated_with_warning"
+    assert plan["package_smiles_inchi_keys"] == {
+        "nfdi4chem-mol100": smiles_key,
+        "nfdi4chem-mol200": smiles_key,
     }
+    assert plan["corrected_canonical_isomeric_smiles"] == corrected_smiles
+    assert plan["corrected_smiles_inchi_key"] == expected_key
+
+
+def test_invalid_smiles_still_blocks_pair():
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="invalid or missing SMILES"):
+        validate_pair(second=duplicate_package(
+            "nfdi4chem-mol200", smiles="not-a-smiles"))
+
+
+def test_invalid_inchi_still_blocks_pair():
+    bad = duplicate_package("nfdi4chem-mol200")
+    for extra in bad["extras"]:
+        if extra["key"] == "inchi":
+            extra["value"] = "not-an-inchi"
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="invalid or missing InChI"):
+        validate_pair(second=bad)
 
 
 def test_missing_formula_is_planned_for_backfill_and_complete_package_wins():
@@ -624,6 +691,62 @@ def test_manifest_output_contains_only_required_columns(tmp_path):
         "inchi_key,keep_package,remove_package",
         ETHANOL_KEY + ",nfdi4chem-mol100,nfdi4chem-mol200",
     ]
+
+
+def test_warning_pair_is_in_manifest_and_summary(monkeypatch, tmp_path):
+    class WarningAuditSession(object):
+        def __init__(self):
+            self.rolled_back = 0
+
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            assert not sql.upper().startswith(("INSERT", "UPDATE", "DELETE"))
+            if statement is cli.DUPLICATE_GROUPS_SQL:
+                return BackfillResult([(ETHANOL_KEY, ["one", "two"])])
+            if "FROM public.package" in sql:
+                return BackfillResult([(10,)])
+            if "FROM rdk.molecules" in sql:
+                return BackfillResult([(9,)])
+            if "FROM rdk.fingerprints" in sql:
+                return BackfillResult([(9,)])
+            raise AssertionError(sql)
+
+        def rollback(self):
+            self.rolled_back += 1
+
+        def commit(self):
+            pytest.fail("dry-run audit must never commit")
+
+    packages = {
+        "one": duplicate_package("nfdi4chem-mol100"),
+        "two": duplicate_package("nfdi4chem-mol200"),
+    }
+    monkeypatch.setattr(cli, "_load_dedup_package",
+                        lambda session, package_id: packages[package_id])
+    warning_plan = {
+        "status": "validated_with_warning",
+        "warning": "smiles_stereochemistry_mismatch",
+        "planned_smiles_replacement": True,
+        "inchi_key": ETHANOL_KEY,
+        "keep_package": "nfdi4chem-mol100",
+        "remove_package": "nfdi4chem-mol200",
+        "differing_titles": False,
+        "equivalent_differing_smiles": True,
+        "missing_formulas": [],
+        "relationships_requiring_migration": 0,
+    }
+    monkeypatch.setattr(cli, "validate_duplicate_pair",
+                        lambda session, key, items: warning_plan)
+    session = WarningAuditSession()
+    output = tmp_path / "warning.csv"
+    plans, blocked, summary = cli.deduplicate_molecule_packages_dry_run(
+        session, str(output))
+    assert plans == [warning_plan] and blocked == []
+    assert summary["smiles_stereochemistry_mismatches"] == 1
+    assert summary["planned_smiles_replacements"] == 1
+    assert summary["database_changed"] is False
+    assert session.rolled_back == 1
+    assert ETHANOL_KEY in output.read_text()
 
 
 def test_dedup_command_exposes_no_apply_option():
