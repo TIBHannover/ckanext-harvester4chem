@@ -1,6 +1,7 @@
 import csv
 import json
 import time
+from datetime import datetime
 
 import click
 from sqlalchemy import text
@@ -12,7 +13,7 @@ from ckanext.harvester4chem.molecule_sync import (
     MoleculeSyncError, TECHNICAL_MOLECULE_NAME,
     create_validated_rdk_backfill, normalize_chemical_text,
     normalize_inchi_structure, normalize_smiles_structure,
-    normalized_inchi_key, synchronize_molecule,
+    normalize_structure, normalized_inchi_key, synchronize_molecule,
     validate_rdk_backfill_package,
 )
 
@@ -1535,32 +1536,104 @@ def verify_command():
 
 @harvester4chem.command(name="sync-package")
 @click.argument("package_id")
-@click.option("--dry-run", is_flag=True, required=True,
-              help="Execute all SQL and roll it back.")
+@click.option("--dry-run", is_flag=True,
+              help="Validate and prepare the plan without persistent writes.")
+@click.option("--apply", "apply_mode", is_flag=True,
+              help="Apply the validated, resumable plan.")
+@click.option("--audit-log", type=click.Path(dir_okay=False))
+@click.option("--confirm")
+@click.option("--expected-inchi-key")
 @click.option("--write-legacy/--no-write-legacy", default=None,
               help=("Diagnostic override for legacy-table validation; the "
                     "default is ckan.harvester4chem.write_legacy."))
-def sync_package_command(package_id, dry_run, write_legacy):
-    """Validate and dry-run synchronization of one existing CKAN package."""
-    package = toolkit.get_action("package_show")(
-        {"ignore_auth": True}, {"id": package_id}
-    )
-    result = synchronize_molecule(
-        package_id=package["id"],
-        inchi_code=_package_value(package, "inchi"),
-        inchi_key=_package_value(package, "inchi_key"),
-        smiles=_package_value(package, "smiles"),
-        mol_formula=_package_value(package, "mol_formula"),
-        exact_mass=(_package_value(package, "exactmass") or
-                    _package_value(package, "exact_mass")),
-        names=[package.get("title")],
-        name_source="CKAN",
-        session=model.Session,
-        dry_run=dry_run,
-        write_legacy=write_legacy,
-    )
-    model.Session.rollback()
-    click.echo(json.dumps(result, sort_keys=True))
+def sync_package_command(package_id, dry_run, apply_mode, audit_log, confirm,
+                         expected_inchi_key, write_legacy):
+    """Validate and synchronize one active dataset; safe to rerun by design."""
+    if dry_run == apply_mode:
+        raise click.UsageError("exactly one of --dry-run or --apply is required")
+    if apply_mode and not audit_log:
+        raise click.UsageError("--apply requires --audit-log PATH")
+    if apply_mode and confirm != "SYNCHRONIZE_VALIDATED_MOLECULE":
+        raise click.UsageError(
+            "--apply requires --confirm SYNCHRONIZE_VALIDATED_MOLECULE")
+    mode = "apply" if apply_mode else "dry-run"
+    record = {"timestamp": datetime.utcnow().isoformat() + "Z", "mode": mode,
+              "dataset_id": package_id, "dataset_name": None,
+              "normalized_inchi_key": None, "validation_result": "failed",
+              "molecule_package_id": None, "molecule_package_name": None,
+              "molecule_package_status": "not_run",
+              "rdkit_molecule_id": None, "rdkit_molecule_status": "not_run",
+              "fingerprint_status": "not_run", "relationship_status": "not_run",
+              "dataset_solr_status": "not_run", "molecule_solr_status": "not_run",
+              "overall_status": "failed", "error": None, "warning": None}
+    try:
+        package = toolkit.get_action("package_show")(
+            {"ignore_auth": True}, {"id": package_id})
+        if package.get("state", "active") != "active" or \
+                package.get("type", "dataset") == "molecule":
+            raise MoleculeSyncError("source must be an active dataset")
+        record.update(dataset_id=package["id"], dataset_name=package.get("name"))
+        chemistry = normalize_structure(
+            _package_value(package, "inchi"), _package_value(package, "inchi_key"),
+            _package_value(package, "smiles"), _package_value(package, "mol_formula"),
+            _package_value(package, "exactmass") or _package_value(package, "exact_mass"))
+        record["normalized_inchi_key"] = chemistry["inchi_key"]
+        expected = normalized_inchi_key(expected_inchi_key)
+        if expected and expected != chemistry["inchi_key"]:
+            raise MoleculeSyncError(
+                "expected InChIKey {0}, calculated {1}".format(
+                    expected, chemistry["inchi_key"]))
+        record["validation_result"] = "valid"
+        result = synchronize_molecule(
+            package_id=package["id"], inchi_code=chemistry["inchi_code"],
+            inchi_key=chemistry["inchi_key"], smiles=chemistry["canonical_smiles"],
+            mol_formula=chemistry["mol_formula"], exact_mass=chemistry["exact_mass"],
+            names=[package.get("title")], name_source="CKAN", session=model.Session,
+            dry_run=dry_run, write_legacy=write_legacy)
+        record.update(
+            molecule_package_id=result.get("molecule_package_id"),
+            molecule_package_status=result.get("molecule_package", "planned"),
+            rdkit_molecule_id=result.get("rdk_molecule_id"),
+            rdkit_molecule_status=result.get("rdkit_molecule_status", "ensured"),
+            fingerprint_status=result.get("fingerprint_status", "ensured"),
+            relationship_status=result.get("ckan_relationship", "planned"))
+        molecule_id = result.get("molecule_package_id")
+        molecule = toolkit.get_action("package_show")(
+            {"ignore_auth": True}, {"id": molecule_id}) \
+            if molecule_id and (not dry_run or
+                                result.get("molecule_package") == "existing") else None
+        record["molecule_package_name"] = (molecule or {}).get("name")
+        if dry_run:
+            model.Session.rollback()
+            record["overall_status"] = "dry_run_validated"
+        else:
+            # Database/action stages may already have committed independently.
+            # Indexing is deliberately reported and retried as a separate stage.
+            model.Session.commit()
+            warnings = []
+            for key, item in (("dataset_solr_status", package),
+                              ("molecule_solr_status", molecule)):
+                indexed = _reindex_recovery_package(item, toolkit.get_action)
+                record[key] = indexed["status"]
+                if indexed["status"] == "failed":
+                    warnings.append(item["name"])
+            if warnings:
+                record["overall_status"] = "completed_with_index_warning"
+                record["warning"] = "individual reindex required: " + ", ".join(warnings)
+            else:
+                record["overall_status"] = "completed"
+    except Exception as error:
+        model.Session.rollback()
+        record["error"] = str(error)
+        if apply_mode and record["validation_result"] == "valid":
+            record["overall_status"] = "incomplete_resumable"
+        raise
+    finally:
+        line = json.dumps(record, sort_keys=True)
+        if audit_log:
+            with open(audit_log, "a") as stream:
+                stream.write(line + "\n")
+        click.echo(line)
 
 
 @harvester4chem.command(name="repair-missing-rdk")

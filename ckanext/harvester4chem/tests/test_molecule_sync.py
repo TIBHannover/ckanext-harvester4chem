@@ -61,9 +61,15 @@ class FakeSession(object):
             return Result()
         if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
             return Result([(item,) for item in self.candidate_ids])
+        if sql.startswith("WITH allocator_lock AS"):
+            return Result([(12346,)])
         if sql.startswith("SELECT molecule_id FROM rdk.molecules"):
             row = self.state["rdk"].get(params["inchi_code"])
             return Result([(row[0],)] if row else [])
+        if sql.startswith("SELECT molecule_id FROM rdk.fingerprints"):
+            molecule_id = params["molecule_id"]
+            return Result([(molecule_id,)] if molecule_id in
+                           self.state["fingerprints"] else [])
         if sql.startswith("INSERT INTO rdk.molecules"):
             current = self.state["rdk"].get(params["inchi_code"])
             molecule_id = current[0] if current else len(self.state["rdk"]) + 101
@@ -234,14 +240,23 @@ def test_package_and_ckan_relationship_are_created_in_correct_direction():
     assert create_context["defer_commit"] is True
 
 
-def test_new_relationship_write_is_blocked_before_committing_action():
+def test_sequence_allocator_generates_short_numeric_name_without_uuid_integer():
+    session = FakeSession()
+    name = molecule_sync._allocate_molecule_package_name(session)
+    assert name == "nfdi4chem-mol12346"
+    assert len(name) < 30
+    assert "uuid4().int" not in open(molecule_sync.__file__).read()
+
+
+def test_new_relationship_is_created_and_verified():
     actions = Actions()
-    with pytest.raises(molecule_sync.MoleculeSyncError,
-                       match="commits independently"):
-        molecule_sync.ensure_dataset_molecule_package_relationship(
-            "dataset-id", "molecule-id", action_getter=actions.get)
-    assert not any(name == "relationship_relation_create"
-                   for name, _ in actions.calls)
+    result = molecule_sync.ensure_dataset_molecule_package_relationship(
+        "dataset-id", "molecule-id", action_getter=actions.get)
+    assert result == "created"
+    create = [data for name, data in actions.calls
+              if name == "relationship_relation_create"]
+    assert create == [{"subject_id": "dataset-id", "object_id": "molecule-id",
+                       "relation_type": "related_to"}]
 
 
 def test_second_execution_is_idempotent():
@@ -258,6 +273,19 @@ def test_second_execution_is_idempotent():
     assert len(session.state["fingerprints"]) == 1
     assert len([name for _, name in session.state["names"]
                 if name.lower() == "ethanol"]) == 1
+
+
+def test_seven_datasets_share_one_package_rdk_row_and_seven_relationships():
+    session, actions = FakeSession(), Actions()
+    package = existing_package(session, actions)
+    actions.relations = []
+    for number in range(7):
+        result = run(session, actions, package_id="dataset-{0}".format(number))
+        assert result["molecule_package_id"] == package["id"]
+    assert len(actions.packages) == 1
+    assert len(session.state["rdk"]) == 1
+    assert len(session.state["fingerprints"]) == 1
+    assert len(actions.relations) == 7
 
 
 def test_rdk_is_synchronized_from_molecule_package_metadata():
@@ -300,18 +328,17 @@ def test_candidate_lookup_requires_active_nonblank_extras():
     assert "btrim(e.value)<>''" in sql
 
 
-def test_exact_duplicate_packages_reuse_one_and_report_others():
+def test_exact_duplicate_packages_block_apply():
     session, actions = FakeSession(), Actions()
     values = molecule_sync.normalize_structure(smiles="CCO")
     first = molecule_sync._package_payload(values, ["one"])
     second = molecule_sync._package_payload(values, ["two"])
     actions.packages = {first["id"]: first, second["id"]: second}
     session.candidate_ids = [first["id"], second["id"]]
-    package, duplicates, created = molecule_sync.ensure_molecule_package(
-        values, session=session, action_getter=actions.get)
-    assert package["id"] == first["id"]
-    assert duplicates == [second["id"]]
-    assert created is False
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="duplicate active molecule packages"):
+        molecule_sync.ensure_molecule_package(
+            values, session=session, action_getter=actions.get)
 
 
 def test_chemically_different_duplicate_package_fails_safely():
