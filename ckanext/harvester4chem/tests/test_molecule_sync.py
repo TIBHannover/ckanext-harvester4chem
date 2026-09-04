@@ -61,7 +61,9 @@ class FakeSession(object):
             return Result()
         if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
             return Result([(item,) for item in self.candidate_ids])
-        if sql.startswith("WITH allocator_lock AS"):
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return Result([(None,)])
+        if sql.startswith("SELECT COALESCE(max(substring"):
             return Result([(12346,)])
         if sql.startswith("SELECT molecule_id FROM rdk.molecules"):
             row = self.state["rdk"].get(params["inchi_code"])
@@ -248,6 +250,67 @@ def test_sequence_allocator_generates_short_numeric_name_without_uuid_integer():
     assert "uuid4().int" not in open(molecule_sync.__file__).read()
 
 
+def test_locked_identity_recheck_reuses_concurrent_package_without_create():
+    actions = Actions()
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    concurrent = molecule_sync._package_payload(
+        values, ["Ethanol"], "nfdi4chem-mol88")
+
+    class WindowSession(FakeSession):
+        def __init__(self):
+            super(WindowSession, self).__init__()
+            self.identity_lookups = 0
+
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            if sql.startswith("SELECT pg_advisory_xact_lock"):
+                self.sql.append((sql, copy.deepcopy(params or {})))
+                actions.packages[concurrent["id"]] = concurrent
+                self.candidate_ids = [concurrent["id"]]
+                return Result([(None,)])
+            if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
+                self.identity_lookups += 1
+            return super(WindowSession, self).execute(statement, params)
+
+    session = WindowSession()
+    package, duplicates, created = molecule_sync.ensure_molecule_package(
+        values, session=session, action_getter=actions.get)
+    statements = [sql for sql, unused in session.sql]
+    lock_index = next(index for index, sql in enumerate(statements)
+                      if sql.startswith("SELECT pg_advisory_xact_lock"))
+    lookup_indexes = [index for index, sql in enumerate(statements)
+                      if sql.startswith("SELECT DISTINCT p.id")]
+    assert lookup_indexes[-1] > lock_index
+    assert session.identity_lookups == 2
+    assert package["id"] == concurrent["id"]
+    assert duplicates == []
+    assert created is False
+    assert not any(name == "package_create" for name, unused in actions.calls)
+
+
+def test_two_simulated_workers_create_only_one_package_for_identity():
+    actions = Actions()
+    values = molecule_sync.normalize_structure(smiles="CCO")
+
+    class SharedSession(FakeSession):
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
+                self.candidate_ids = [package["id"] for package in
+                                      actions.packages.values()
+                                      if package.get("inchi_key") == ETHANOL_KEY]
+            return super(SharedSession, self).execute(statement, params)
+
+    first = molecule_sync.ensure_molecule_package(
+        values, session=SharedSession(), action_getter=actions.get)
+    second = molecule_sync.ensure_molecule_package(
+        values, session=SharedSession(), action_getter=actions.get)
+    assert first[0]["id"] == second[0]["id"]
+    assert len(actions.packages) == 1
+    assert len([call for call in actions.calls
+                if call[0] == "package_create"]) == 1
+
+
 def test_new_relationship_is_created_and_verified():
     actions = Actions()
     result = molecule_sync.ensure_dataset_molecule_package_relationship(
@@ -360,6 +423,7 @@ def test_dry_run_validates_every_stage_and_performs_no_writes():
     before = copy.deepcopy(session.state)
     result = run(session, actions, dry_run=True)
     assert result["dry_run"] is True
+    assert result["molecule_package"] == "allocated_on_apply"
     assert session.state == before
     assert actions.packages == {}
     assert actions.relations == []

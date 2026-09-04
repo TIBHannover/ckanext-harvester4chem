@@ -1604,6 +1604,11 @@ def sync_package_command(package_id, dry_run, apply_mode, audit_log, confirm,
                                 result.get("molecule_package") == "existing") else None
         record["molecule_package_name"] = (molecule or {}).get("name")
         if dry_run:
+            if result.get("molecule_package") == "allocated_on_apply":
+                record["molecule_package_name"] = "allocated_on_apply"
+            record["warning"] = (
+                "RDKit rows are rolled back, but PostgreSQL sequence values "
+                "used for surrogate RDKit IDs may advance during dry-run")
             model.Session.rollback()
             record["overall_status"] = "dry_run_validated"
         else:

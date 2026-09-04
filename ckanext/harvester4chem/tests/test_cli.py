@@ -50,7 +50,13 @@ def test_sync_package_legacy_override_is_optional(monkeypatch, flag, expected):
     def synchronize(**kwargs):
         captured.update(kwargs)
         return {"legacy": {"status": "skipped",
-                           "relationship": "skipped"}}
+                           "relationship": "skipped"},
+                "molecule_package": "allocated_on_apply",
+                "molecule_package_id": "planned-id",
+                "rdk_molecule_id": 101,
+                "rdkit_molecule_status": "created",
+                "fingerprint_status": "created",
+                "ckan_relationship": "planned"}
 
     monkeypatch.setattr(cli, "synchronize_molecule", synchronize)
     monkeypatch.setattr(cli.model.Session, "rollback", lambda: None)
@@ -61,6 +67,10 @@ def test_sync_package_legacy_override_is_optional(monkeypatch, flag, expected):
     assert result.exit_code == 0
     assert captured["write_legacy"] is expected
     assert captured["dry_run"] is True
+    audit = json.loads(result.output)
+    assert audit["molecule_package_name"] == "allocated_on_apply"
+    assert audit["molecule_package_status"] == "allocated_on_apply"
+    assert "sequence values" in audit["warning"]
 
 
 def test_verification_queries_are_read_only_and_cover_required_checks():

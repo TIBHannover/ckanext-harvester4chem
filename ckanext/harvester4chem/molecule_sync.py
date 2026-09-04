@@ -254,7 +254,14 @@ def _package_values(package):
         _package_value(package, "exact_mass"))
 
 
-def _allocate_molecule_package_name(session=None):
+def _acquire_molecule_name_allocator_lock(session=None):
+    """Serialize identity recheck and numeric package-name allocation."""
+    session = session or model.Session
+    session.execute(text("SELECT pg_advisory_xact_lock(:allocator_lock)"),
+                    {"allocator_lock": MOLECULE_NAME_ALLOCATOR_LOCK})
+
+
+def _allocate_molecule_package_name(session=None, lock_held=False):
     """Allocate a short name while holding a transaction-scoped PG lock.
 
     The advisory lock serializes all allocators until the current transaction
@@ -262,15 +269,14 @@ def _allocate_molecule_package_name(session=None):
     requires no schema object and package creation still goes through CKAN.
     """
     session = session or model.Session
+    if not lock_held:
+        _acquire_molecule_name_allocator_lock(session)
     row = _one(session, """
-        WITH allocator_lock AS (
-          SELECT pg_advisory_xact_lock(:allocator_lock)
-        )
         SELECT COALESCE(max(substring(p.name from
           '^nfdi4chem-mol([0-9]+)$')::bigint), 0) + 1
-        FROM public.package p, allocator_lock
+        FROM public.package p
         WHERE p.name ~ '^nfdi4chem-mol[0-9]+$'
-    """, {"allocator_lock": MOLECULE_NAME_ALLOCATOR_LOCK})
+    """, {})
     if not row or row[0] is None:
         raise MoleculeSyncError("molecule package name allocation failed")
     return "nfdi4chem-mol{0}".format(row[0])
@@ -324,13 +330,16 @@ def ensure_molecule_package(values, names=None, session=None,
     create = action_getter("package_create")
     show = action_getter("package_show")
     for unused_attempt in range(PACKAGE_CREATE_RETRIES):
-        # Another worker may have completed this identity since preflight.
+        # The identity recheck and allocation/create are one critical section.
+        # A waiting worker sees the package committed by the lock predecessor.
+        _acquire_molecule_name_allocator_lock(session)
         found, duplicates, created = ensure_molecule_package(
             values, names, session, action_getter, dry_run=True)
         if not created:
             return found, duplicates, False
         payload = _package_payload(
-            values, names, _allocate_molecule_package_name(session))
+            values, names, _allocate_molecule_package_name(
+                session, lock_held=True))
         try:
             # Required CKAN-level candidate check.  NotFound means available.
             try:
@@ -551,13 +560,20 @@ def synchronize_molecule(package_id, inchi_code=None, inchi_key=None,
         else:
             legacy = {"status": "skipped", "relationship": "skipped",
                       "reason": "legacy writes disabled"}
+        # Dry-run DML is rolled back.  PostgreSQL sequence values used by the
+        # RDKit molecule table are non-transactional and may still advance;
+        # gaps in those surrogate IDs are expected and harmless.
         rdk = synchronize_molecule_package_with_rdk(
             package, session, name_source, with_status=True)
         relation = ensure_dataset_molecule_package_relationship(
             package_id, package["id"], action_getter, dry_run,
             molecule_name=package.get("name"))
-        result = {"legacy": legacy, "molecule_package_id": package["id"],
-                  "molecule_package": "created" if created else "existing",
+        result = {"legacy": legacy,
+                  "molecule_package_id": (
+                      None if dry_run and created else package["id"]),
+                  "molecule_package": (
+                      "allocated_on_apply" if dry_run and created else
+                      "created" if created else "existing"),
                   "duplicate_molecule_package_ids": duplicates,
                   "rdk_molecule_id": rdk["molecule_id"],
                   "rdkit_molecule_status": rdk["molecule_status"],
