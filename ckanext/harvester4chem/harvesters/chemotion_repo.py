@@ -18,7 +18,9 @@ from ckan.model import Session
 from ckan.logic import get_action
 from ckan import model
 
-from ckanext.harvester4chem.molecule_sync import synchronize_harvested_package
+from ckanext.harvester4chem.molecule_sync import (
+    normalize_structure, synchronize_harvested_package,
+)
 
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckan.lib.munge import munge_tag
@@ -286,21 +288,39 @@ class ChemotionRepoHarvester(HarvesterBase):
 
             # creating package
             log.debug("Create/update package using dict: %s" % package_dict)
+            # Complete chemical validation precedes the package action.  The
+            # shared synchronizer validates again and resumes any missing
+            # post-import stages after independently committed actions.
+            normalize_structure(
+                package_dict.get("inchi"), package_dict.get("inchi_key"),
+                package_dict.get("smiles"), package_dict.get("mol_formula"),
+                package_dict.get("exactmass"))
             transaction = Session.begin_nested()
             package_result = self._create_or_update_package(
                 package_dict, harvest_object, "package_show"
             )
             if not package_result:
                 raise RuntimeError("CKAN package create/update failed")
-            synchronize_harvested_package(
+            sync_result = synchronize_harvested_package(
                 package_dict, harvest_object,
                 names=[content.get('name'), content_hasBioPart.get('iupacName')],
                 name_source="Chemotion",
             )
-            rebuild(package_dict["name"])
             if transaction.is_active:
                 transaction.commit()
             Session.commit()
+
+            # Solr is a separate resumable stage.  ckanext-relationship commits
+            # independently, so an indexing outage must not be reported as a
+            # rollback of successful CKAN/RDKit writes.
+            for package_ref in (package_dict["name"],
+                                sync_result["molecule_package_id"]):
+                try:
+                    rebuild(package_ref)
+                except Exception as index_error:
+                    log.warning(
+                        "HARVESTER4CHEM synchronized package %s but individual "
+                        "Solr reindex is required: %s", package_ref, index_error)
 
             log.debug("Finished record")
 

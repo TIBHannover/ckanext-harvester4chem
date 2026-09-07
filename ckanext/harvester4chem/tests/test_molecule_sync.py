@@ -61,9 +61,17 @@ class FakeSession(object):
             return Result()
         if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
             return Result([(item,) for item in self.candidate_ids])
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return Result([(None,)])
+        if sql.startswith("SELECT COALESCE(max(substring"):
+            return Result([(12346,)])
         if sql.startswith("SELECT molecule_id FROM rdk.molecules"):
             row = self.state["rdk"].get(params["inchi_code"])
             return Result([(row[0],)] if row else [])
+        if sql.startswith("SELECT molecule_id FROM rdk.fingerprints"):
+            molecule_id = params["molecule_id"]
+            return Result([(molecule_id,)] if molecule_id in
+                           self.state["fingerprints"] else [])
         if sql.startswith("INSERT INTO rdk.molecules"):
             current = self.state["rdk"].get(params["inchi_code"])
             molecule_id = current[0] if current else len(self.state["rdk"]) + 101
@@ -185,6 +193,68 @@ def test_supplied_inchi_key_mismatch_fails():
             inchi_key="AAAAAAAAAAAAAA-BBBBBBBBBB-C")
 
 
+@pytest.mark.parametrize("blank", [None, "", "   "])
+@pytest.mark.parametrize("normalizer", [molecule_sync.normalize_structure,
+                                       molecule_sync.normalize_inchi_structure])
+def test_direct_inchi_key_required(monkeypatch, blank, normalizer):
+    monkeypatch.setattr(molecule_sync.rd_inchi, "InchiToInchiKey",
+                        lambda value: blank)
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="null or blank"):
+        normalizer(ETHANOL_INCHI, ETHANOL_KEY)
+
+
+@pytest.mark.parametrize("normalizer", [molecule_sync.normalize_structure,
+                                       molecule_sync.normalize_smiles_structure])
+def test_smiles_only_mismatch_remains_strict(normalizer):
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
+        normalizer(smiles="CCO", inchi_key="AAAAAAAAAAAAAA-BBBBBBBBBB-C")
+
+
+def test_roundtrip_warning_preserves_direct_identity(monkeypatch, caplog):
+    roundtrip = "AAAAAAAAAAAAAA-UHFFFAOYSA-N"
+    monkeypatch.setattr(molecule_sync.rd_inchi, "MolToInchiKey",
+                        lambda mol: roundtrip)
+    values = molecule_sync.normalize_structure(ETHANOL_INCHI, ETHANOL_KEY)
+    assert values["inchi_key"] == ETHANOL_KEY
+    assert values["inchi_code"] == ETHANOL_INCHI
+    assert values["warnings"] == [{
+        "code": "rdkit_inchi_stereochemistry_roundtrip_loss",
+        "direct_inchi_key": ETHANOL_KEY, "roundtrip_inchi_key": roundtrip}]
+    assert ETHANOL_KEY in caplog.text and roundtrip in caplog.text
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
+        molecule_sync.normalize_structure(ETHANOL_INCHI, roundtrip, smiles="CCO")
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_existing_structure_only_adds_relationship(monkeypatch, dry_run):
+    session, actions = FakeSession(), Actions()
+    package = existing_package(session, actions)
+    actions.relations = []
+    values = molecule_sync.normalize_structure(ETHANOL_INCHI, ETHANOL_KEY)
+    session.state["rdk"][ETHANOL_INCHI] = (101, values)
+    session.state["fingerprints"].add(101)
+    before = copy.deepcopy(session.state)
+    packages_before = copy.deepcopy(actions.packages)
+    monkeypatch.setattr(molecule_sync.rd_inchi, "MolToInchiKey",
+                        lambda mol: "AAAAAAAAAAAAAA-UHFFFAOYSA-N")
+    result = run(session, actions, dry_run=dry_run, write_legacy=False)
+    assert result["warnings"][0]["code"] == (
+        "rdkit_inchi_stereochemistry_roundtrip_loss")
+    assert result["molecule_package"] == "existing"
+    assert result["rdkit_molecule_status"] == "existing"
+    assert result["fingerprint_status"] == "existing"
+    assert result["ckan_relationship"] == ("planned" if dry_run else "created")
+    assert session.state == before
+    assert actions.packages == packages_before
+    assert all(sql.startswith("SELECT") for sql, params in session.sql)
+    mutations = [(name, data) for name, data in actions.calls
+                 if name not in ("package_show", "relationship_relations_list")]
+    assert mutations == ([] if dry_run else [
+        ("relationship_relation_create", {
+            "subject_id": "dataset-id", "object_id": package["id"],
+            "relation_type": "related_to"})])
+
+
 def test_inchi_key_mismatch_performs_no_write():
     session, actions = FakeSession(), Actions()
     with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
@@ -234,14 +304,84 @@ def test_package_and_ckan_relationship_are_created_in_correct_direction():
     assert create_context["defer_commit"] is True
 
 
-def test_new_relationship_write_is_blocked_before_committing_action():
+def test_sequence_allocator_generates_short_numeric_name_without_uuid_integer():
+    session = FakeSession()
+    name = molecule_sync._allocate_molecule_package_name(session)
+    assert name == "nfdi4chem-mol12346"
+    assert len(name) < 30
+    assert "uuid4().int" not in open(molecule_sync.__file__).read()
+
+
+def test_locked_identity_recheck_reuses_concurrent_package_without_create():
     actions = Actions()
-    with pytest.raises(molecule_sync.MoleculeSyncError,
-                       match="commits independently"):
-        molecule_sync.ensure_dataset_molecule_package_relationship(
-            "dataset-id", "molecule-id", action_getter=actions.get)
-    assert not any(name == "relationship_relation_create"
-                   for name, _ in actions.calls)
+    values = molecule_sync.normalize_structure(smiles="CCO")
+    concurrent = molecule_sync._package_payload(
+        values, ["Ethanol"], "nfdi4chem-mol88")
+
+    class WindowSession(FakeSession):
+        def __init__(self):
+            super(WindowSession, self).__init__()
+            self.identity_lookups = 0
+
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            if sql.startswith("SELECT pg_advisory_xact_lock"):
+                self.sql.append((sql, copy.deepcopy(params or {})))
+                actions.packages[concurrent["id"]] = concurrent
+                self.candidate_ids = [concurrent["id"]]
+                return Result([(None,)])
+            if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
+                self.identity_lookups += 1
+            return super(WindowSession, self).execute(statement, params)
+
+    session = WindowSession()
+    package, duplicates, created = molecule_sync.ensure_molecule_package(
+        values, session=session, action_getter=actions.get)
+    statements = [sql for sql, unused in session.sql]
+    lock_index = next(index for index, sql in enumerate(statements)
+                      if sql.startswith("SELECT pg_advisory_xact_lock"))
+    lookup_indexes = [index for index, sql in enumerate(statements)
+                      if sql.startswith("SELECT DISTINCT p.id")]
+    assert lookup_indexes[-1] > lock_index
+    assert session.identity_lookups == 2
+    assert package["id"] == concurrent["id"]
+    assert duplicates == []
+    assert created is False
+    assert not any(name == "package_create" for name, unused in actions.calls)
+
+
+def test_two_simulated_workers_create_only_one_package_for_identity():
+    actions = Actions()
+    values = molecule_sync.normalize_structure(smiles="CCO")
+
+    class SharedSession(FakeSession):
+        def execute(self, statement, params=None):
+            sql = " ".join(str(statement).split())
+            if sql.startswith("SELECT DISTINCT p.id FROM public.package"):
+                self.candidate_ids = [package["id"] for package in
+                                      actions.packages.values()
+                                      if package.get("inchi_key") == ETHANOL_KEY]
+            return super(SharedSession, self).execute(statement, params)
+
+    first = molecule_sync.ensure_molecule_package(
+        values, session=SharedSession(), action_getter=actions.get)
+    second = molecule_sync.ensure_molecule_package(
+        values, session=SharedSession(), action_getter=actions.get)
+    assert first[0]["id"] == second[0]["id"]
+    assert len(actions.packages) == 1
+    assert len([call for call in actions.calls
+                if call[0] == "package_create"]) == 1
+
+
+def test_new_relationship_is_created_and_verified():
+    actions = Actions()
+    result = molecule_sync.ensure_dataset_molecule_package_relationship(
+        "dataset-id", "molecule-id", action_getter=actions.get)
+    assert result == "created"
+    create = [data for name, data in actions.calls
+              if name == "relationship_relation_create"]
+    assert create == [{"subject_id": "dataset-id", "object_id": "molecule-id",
+                       "relation_type": "related_to"}]
 
 
 def test_second_execution_is_idempotent():
@@ -258,6 +398,19 @@ def test_second_execution_is_idempotent():
     assert len(session.state["fingerprints"]) == 1
     assert len([name for _, name in session.state["names"]
                 if name.lower() == "ethanol"]) == 1
+
+
+def test_seven_datasets_share_one_package_rdk_row_and_seven_relationships():
+    session, actions = FakeSession(), Actions()
+    package = existing_package(session, actions)
+    actions.relations = []
+    for number in range(7):
+        result = run(session, actions, package_id="dataset-{0}".format(number))
+        assert result["molecule_package_id"] == package["id"]
+    assert len(actions.packages) == 1
+    assert len(session.state["rdk"]) == 1
+    assert len(session.state["fingerprints"]) == 1
+    assert len(actions.relations) == 7
 
 
 def test_rdk_is_synchronized_from_molecule_package_metadata():
@@ -300,18 +453,17 @@ def test_candidate_lookup_requires_active_nonblank_extras():
     assert "btrim(e.value)<>''" in sql
 
 
-def test_exact_duplicate_packages_reuse_one_and_report_others():
+def test_exact_duplicate_packages_block_apply():
     session, actions = FakeSession(), Actions()
     values = molecule_sync.normalize_structure(smiles="CCO")
     first = molecule_sync._package_payload(values, ["one"])
     second = molecule_sync._package_payload(values, ["two"])
     actions.packages = {first["id"]: first, second["id"]: second}
     session.candidate_ids = [first["id"], second["id"]]
-    package, duplicates, created = molecule_sync.ensure_molecule_package(
-        values, session=session, action_getter=actions.get)
-    assert package["id"] == first["id"]
-    assert duplicates == [second["id"]]
-    assert created is False
+    with pytest.raises(molecule_sync.MoleculeSyncError,
+                       match="duplicate active molecule packages"):
+        molecule_sync.ensure_molecule_package(
+            values, session=session, action_getter=actions.get)
 
 
 def test_chemically_different_duplicate_package_fails_safely():
@@ -333,6 +485,7 @@ def test_dry_run_validates_every_stage_and_performs_no_writes():
     before = copy.deepcopy(session.state)
     result = run(session, actions, dry_run=True)
     assert result["dry_run"] is True
+    assert result["molecule_package"] == "allocated_on_apply"
     assert session.state == before
     assert actions.packages == {}
     assert actions.relations == []
