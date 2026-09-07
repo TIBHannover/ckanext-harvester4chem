@@ -1565,7 +1565,8 @@ def sync_package_command(package_id, dry_run, apply_mode, audit_log, confirm,
               "rdkit_molecule_id": None, "rdkit_molecule_status": "not_run",
               "fingerprint_status": "not_run", "relationship_status": "not_run",
               "dataset_solr_status": "not_run", "molecule_solr_status": "not_run",
-              "overall_status": "failed", "error": None, "warning": None}
+              "overall_status": "failed", "error": None, "warning": None,
+              "warnings": []}
     try:
         package = toolkit.get_action("package_show")(
             {"ignore_auth": True}, {"id": package_id})
@@ -1578,6 +1579,7 @@ def sync_package_command(package_id, dry_run, apply_mode, audit_log, confirm,
             _package_value(package, "smiles"), _package_value(package, "mol_formula"),
             _package_value(package, "exactmass") or _package_value(package, "exact_mass"))
         record["normalized_inchi_key"] = chemistry["inchi_key"]
+        record["warnings"] = chemistry.get("warnings", [])
         expected = normalized_inchi_key(expected_inchi_key)
         if expected and expected != chemistry["inchi_key"]:
             raise MoleculeSyncError(

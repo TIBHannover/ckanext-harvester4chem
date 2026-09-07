@@ -193,6 +193,68 @@ def test_supplied_inchi_key_mismatch_fails():
             inchi_key="AAAAAAAAAAAAAA-BBBBBBBBBB-C")
 
 
+@pytest.mark.parametrize("blank", [None, "", "   "])
+@pytest.mark.parametrize("normalizer", [molecule_sync.normalize_structure,
+                                       molecule_sync.normalize_inchi_structure])
+def test_direct_inchi_key_required(monkeypatch, blank, normalizer):
+    monkeypatch.setattr(molecule_sync.rd_inchi, "InchiToInchiKey",
+                        lambda value: blank)
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="null or blank"):
+        normalizer(ETHANOL_INCHI, ETHANOL_KEY)
+
+
+@pytest.mark.parametrize("normalizer", [molecule_sync.normalize_structure,
+                                       molecule_sync.normalize_smiles_structure])
+def test_smiles_only_mismatch_remains_strict(normalizer):
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
+        normalizer(smiles="CCO", inchi_key="AAAAAAAAAAAAAA-BBBBBBBBBB-C")
+
+
+def test_roundtrip_warning_preserves_direct_identity(monkeypatch, caplog):
+    roundtrip = "AAAAAAAAAAAAAA-UHFFFAOYSA-N"
+    monkeypatch.setattr(molecule_sync.rd_inchi, "MolToInchiKey",
+                        lambda mol: roundtrip)
+    values = molecule_sync.normalize_structure(ETHANOL_INCHI, ETHANOL_KEY)
+    assert values["inchi_key"] == ETHANOL_KEY
+    assert values["inchi_code"] == ETHANOL_INCHI
+    assert values["warnings"] == [{
+        "code": "rdkit_inchi_stereochemistry_roundtrip_loss",
+        "direct_inchi_key": ETHANOL_KEY, "roundtrip_inchi_key": roundtrip}]
+    assert ETHANOL_KEY in caplog.text and roundtrip in caplog.text
+    with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):
+        molecule_sync.normalize_structure(ETHANOL_INCHI, roundtrip, smiles="CCO")
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_existing_structure_only_adds_relationship(monkeypatch, dry_run):
+    session, actions = FakeSession(), Actions()
+    package = existing_package(session, actions)
+    actions.relations = []
+    values = molecule_sync.normalize_structure(ETHANOL_INCHI, ETHANOL_KEY)
+    session.state["rdk"][ETHANOL_INCHI] = (101, values)
+    session.state["fingerprints"].add(101)
+    before = copy.deepcopy(session.state)
+    packages_before = copy.deepcopy(actions.packages)
+    monkeypatch.setattr(molecule_sync.rd_inchi, "MolToInchiKey",
+                        lambda mol: "AAAAAAAAAAAAAA-UHFFFAOYSA-N")
+    result = run(session, actions, dry_run=dry_run, write_legacy=False)
+    assert result["warnings"][0]["code"] == (
+        "rdkit_inchi_stereochemistry_roundtrip_loss")
+    assert result["molecule_package"] == "existing"
+    assert result["rdkit_molecule_status"] == "existing"
+    assert result["fingerprint_status"] == "existing"
+    assert result["ckan_relationship"] == ("planned" if dry_run else "created")
+    assert session.state == before
+    assert actions.packages == packages_before
+    assert all(sql.startswith("SELECT") for sql, params in session.sql)
+    mutations = [(name, data) for name, data in actions.calls
+                 if name not in ("package_show", "relationship_relations_list")]
+    assert mutations == ([] if dry_run else [
+        ("relationship_relation_create", {
+            "subject_id": "dataset-id", "object_id": package["id"],
+            "relation_type": "related_to"})])
+
+
 def test_inchi_key_mismatch_performs_no_write():
     session, actions = FakeSession(), Actions()
     with pytest.raises(molecule_sync.MoleculeSyncError, match="mismatch"):

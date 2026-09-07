@@ -73,6 +73,55 @@ def test_sync_package_legacy_override_is_optional(monkeypatch, flag, expected):
     assert "sequence values" in audit["warning"]
 
 
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_sync_cli_roundtrip_loss_only_creates_relationship(
+        monkeypatch, tmp_path, dry_run):
+    from ckanext.harvester4chem.tests.test_molecule_sync import (
+        Actions, FakeSession, ETHANOL_INCHI, existing_package)
+
+    session, actions = FakeSession(), Actions()
+    molecule = existing_package(session, actions)
+    dataset = {"id": "dataset-id", "name": "dataset", "type": "dataset",
+               "state": "active", "inchi": ETHANOL_INCHI,
+               "inchi_key": ETHANOL_KEY, "title": "Ethanol"}
+    actions.packages[dataset["id"]] = dataset
+    actions.relations = []
+    session.state["rdk"][ETHANOL_INCHI] = (
+        101, molecule_sync.normalize_structure(ETHANOL_INCHI))
+    session.state["fingerprints"].add(101)
+    before = copy.deepcopy(session.state)
+    packages_before = copy.deepcopy(actions.packages)
+    session.commit = lambda: None
+    session.rollback = lambda: None
+    monkeypatch.setattr(cli.model, "Session", session)
+    monkeypatch.setattr(cli.toolkit, "get_action", actions.get)
+    monkeypatch.setattr(cli, "_reindex_recovery_package",
+                        lambda package, getter: {"status": "reindexed"})
+    monkeypatch.setattr(molecule_sync.rd_inchi, "MolToInchiKey",
+                        lambda mol: "AAAAAAAAAAAAAA-UHFFFAOYSA-N")
+    args = ["sync-package", "dataset-id", "--no-write-legacy"]
+    args += (["--dry-run"] if dry_run else [
+        "--apply", "--audit-log", str(tmp_path / "sync.jsonl"),
+        "--confirm", "SYNCHRONIZE_VALIDATED_MOLECULE"])
+    result = CliRunner().invoke(cli.harvester4chem, args)
+    assert result.exit_code == 0, result.output
+    record = json.loads(result.output)
+    assert record["validation_result"] == "valid"
+    assert record["normalized_inchi_key"] == ETHANOL_KEY
+    assert record["warnings"][0]["code"] == (
+        "rdkit_inchi_stereochemistry_roundtrip_loss")
+    for field in ("molecule_package_status", "rdkit_molecule_status",
+                  "fingerprint_status"):
+        assert record[field] == "existing"
+    assert record["relationship_status"] == ("planned" if dry_run else "created")
+    assert session.state == before
+    assert actions.packages == packages_before
+    assert all(sql.startswith("SELECT") for sql, params in session.sql)
+    assert actions.relations == ([] if dry_run else [{
+        "subject_id": dataset["id"], "object_id": molecule["id"],
+        "relation_type": "related_to"}])
+
+
 def test_verification_queries_are_read_only_and_cover_required_checks():
     assert set(VERIFY_SQL) == {
         "legacy_relationships_missing_public_molecule",

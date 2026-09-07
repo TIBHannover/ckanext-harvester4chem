@@ -93,11 +93,26 @@ def normalized_inchi_key(value):
     return value.upper() if value else None
 
 
-def _normalized_molecule_values(molecule, mol_formula=None, exact_mass=None):
+def _normalized_molecule_values(molecule, mol_formula=None, exact_mass=None,
+                                inchi_code=None, inchi_key=None):
     canonical = Chem.MolToSmiles(
         molecule, canonical=True, isomericSmiles=True)
-    normalized_inchi = rd_inchi.MolToInchi(molecule)
-    normalized_key = rd_inchi.InchiToInchiKey(normalized_inchi).upper()
+    normalized_inchi = inchi_code or rd_inchi.MolToInchi(molecule)
+    normalized_key = inchi_key or normalized_inchi_key(
+        rd_inchi.InchiToInchiKey(normalized_inchi))
+    if not normalized_key:
+        raise MoleculeSyncError("InChIKey generation returned null or blank")
+    warnings = []
+    if inchi_code:
+        roundtrip_key = normalized_inchi_key(rd_inchi.MolToInchiKey(molecule))
+        if roundtrip_key != normalized_key:
+            warning = {
+                "code": "rdkit_inchi_stereochemistry_roundtrip_loss",
+                "direct_inchi_key": normalized_key,
+                "roundtrip_inchi_key": roundtrip_key}
+            warnings.append(warning)
+            log.warning("HARVESTER4CHEM %s direct_inchi_key=%s roundtrip_inchi_key=%s",
+                        warning["code"], normalized_key, roundtrip_key)
     exact_mass = clean_value(exact_mass)
     try:
         exact_mass = (Descriptors.ExactMolWt(molecule) if exact_mass is None
@@ -109,7 +124,7 @@ def _normalized_molecule_values(molecule, mol_formula=None, exact_mass=None):
             "calculated_formula": rdMolDescriptors.CalcMolFormula(molecule),
             "mol_formula": clean_value(mol_formula) or
             rdMolDescriptors.CalcMolFormula(molecule),
-            "exact_mass": exact_mass}
+            "exact_mass": exact_mass, "warnings": warnings}
 
 
 def normalize_inchi_structure(inchi_code, inchi_key=None, mol_formula=None,
@@ -119,13 +134,24 @@ def normalize_inchi_structure(inchi_code, inchi_key=None, mol_formula=None,
     molecule = rd_inchi.MolFromInchi(inchi_code) if inchi_code else None
     if molecule is None:
         raise MoleculeSyncError("invalid or missing InChI")
-    values = _normalized_molecule_values(molecule, mol_formula, exact_mass)
+    return _validated_inchi_values(molecule, inchi_code, inchi_key,
+                                   mol_formula, exact_mass)
+
+
+def _validated_inchi_values(molecule, inchi_code, inchi_key,
+                            mol_formula, exact_mass):
+    # The parsed Mol can lose /b stereochemistry.  Preserve the input InChI
+    # and derive identity directly from it, before generating representations.
+    direct_key = normalized_inchi_key(rd_inchi.InchiToInchiKey(inchi_code))
+    if not direct_key:
+        raise MoleculeSyncError("InChIKey generation returned null or blank")
     supplied = normalized_inchi_key(inchi_key)
-    if supplied and supplied != values["inchi_key"]:
+    if supplied and supplied != direct_key:
         raise MoleculeSyncError(
             "InChIKey mismatch: supplied {0}, calculated {1}".format(
-                supplied, values["inchi_key"]))
-    return values
+                supplied, direct_key))
+    return _normalized_molecule_values(
+        molecule, mol_formula, exact_mass, inchi_code, direct_key)
 
 
 def normalize_smiles_structure(smiles, inchi_key=None, mol_formula=None,
@@ -152,6 +178,11 @@ def normalize_structure(inchi_code=None, inchi_key=None, smiles=None,
     molecule = None
     if inchi_code:
         molecule = rd_inchi.MolFromInchi(inchi_code)
+        if molecule is not None:
+            values = _validated_inchi_values(
+                molecule, inchi_code, inchi_key, mol_formula, exact_mass)
+            values.pop("calculated_formula")
+            return values
         if molecule is None:
             log.warning("HARVESTER4CHEM could not parse supplied InChI; trying SMILES")
     if molecule is None and smiles:
@@ -378,7 +409,8 @@ def _rdk_names(package, values):
 def synchronize_molecule_package_with_rdk(package, session=None,
                                           name_source="CKAN",
                                           insert_only=False,
-                                          with_status=False):
+                                          with_status=False,
+                                          reuse_existing=False):
     """Upsert rdk.* from a type=molecule package and return its RDKit ID."""
     if package.get("type") != "molecule" or package.get("state", "active") != "active":
         raise MoleculeSyncError("RDKit source must be an active molecule package")
@@ -420,7 +452,11 @@ def synchronize_molecule_package_with_rdk(package, session=None,
         RETURNING molecule_id
     """, {"molecule_id": molecule_id}):
         raise MoleculeSyncError("fingerprint upsert returned no row")
-    for name in _rdk_names(package, values):
+    # Dataset synchronization must not enrich an already complete RDKit row
+    # when only the CKAN relationship is missing.
+    names = ([] if reuse_existing and existing and fingerprint else
+             _rdk_names(package, values))
+    for name in names:
         params = {"molecule_id": molecule_id, "name": name,
                   "source": clean_value(name_source) or "CKAN"}
         if not _one(session, """
@@ -564,11 +600,12 @@ def synchronize_molecule(package_id, inchi_code=None, inchi_key=None,
         # RDKit molecule table are non-transactional and may still advance;
         # gaps in those surrogate IDs are expected and harmless.
         rdk = synchronize_molecule_package_with_rdk(
-            package, session, name_source, with_status=True)
+            package, session, name_source, with_status=True,
+            reuse_existing=not created)
         relation = ensure_dataset_molecule_package_relationship(
             package_id, package["id"], action_getter, dry_run,
             molecule_name=package.get("name"))
-        result = {"legacy": legacy,
+        result = {"legacy": legacy, "warnings": values["warnings"],
                   "molecule_package_id": (
                       None if dry_run and created else package["id"]),
                   "molecule_package": (
