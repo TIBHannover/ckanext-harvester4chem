@@ -7,6 +7,7 @@ from datetime import timedelta
 import re
 from ckan.model import Session
 from ckan.logic import get_action
+from ckanext.harvester4chem.license_utils import apply_license
 from ckan import model
 
 from ckanext.harvest.harvesters.base import HarvesterBase
@@ -345,7 +346,7 @@ class OaipmhDCHarvester(HarvesterBase):
             log.debug(package_dict['measurement_technique'])
 
             # add license
-            package_dict["license_id"] = self._extract_license_id(context=context, content=content)
+            apply_license(package_dict, content.get("rights"), context)
 
             # add resources
             url = self._get_possible_resource(harvest_object, content)
@@ -410,22 +411,6 @@ class OaipmhDCHarvester(HarvesterBase):
 
     def _extract_author(self, content):
         return ", ".join(content["creator"])
-
-    def _extract_license_id(self, context, content):
-        package_license = None
-        content_license = content["rights"]
-        license_list = get_action('license_list')(context.copy(), {})
-        log.debug(f'Here is the license {content_license[1]}')
-        for license_name in license_list:
-            if content_license[1] == license_name['id'] or content_license[1] == license_name['url'] or content_license[1] == \
-                    license_name['title']:
-                package_license = license_name['id']
-            elif content_license[1].startswith("CC BY-NC-SA 4.0") and license_name['id'] == "CC-BY-NC-SA-4.0":
-                package_license = license_name['id']
-            elif content_license[1].startswith("CC BY 4.0") and license_name['id'] == "CC-BY-4.0":
-                package_license = license_name['id']
-
-        return package_license
 
     def _extract_tags_and_extras(self, content):
         extras = []

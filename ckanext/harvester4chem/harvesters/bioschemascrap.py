@@ -12,6 +12,7 @@ from datetime import date
 
 from ckan.model import Session
 from ckan.logic import get_action
+from ckanext.harvester4chem.license_utils import apply_license
 from ckan import model
 
 from ckanext.related_resources.models.related_resources import RelatedResources as related_resources
@@ -173,8 +174,7 @@ class BioSchemaMUHarvester(HarvesterBase):
 
             # add notes, license_id
             package_dict['notes'] = content['description']
-            package_dict["license_id"] = self._extract_license_id(context=context, content=content)
-            log.debug(f'This is the license {package_dict["license_id"]}')
+            apply_license(package_dict, content.get("license"), context)
 
             self._extract_extras_image(package= package_dict,content_hasBioPart= content)
 
@@ -425,14 +425,3 @@ class BioSchemaMUHarvester(HarvesterBase):
         #return extras
 
         return None
-
-    def _extract_license_id(self, context, content):
-        package_license = None
-        content_license = content['license']
-        license_list = get_action('license_list')(context.copy(), {})
-        for license_name in license_list:
-
-            if content_license == license_name['id'] or content_license == license_name['url'] or content_license == license_name['title']:
-                package_license = license_name['id']
-
-        return package_license

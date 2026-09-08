@@ -11,6 +11,7 @@ from ckan import plugins as p
 from ckan.common import config
 from ckan.model import Session
 from ckan.logic import get_action
+from ckanext.harvester4chem.license_utils import apply_license
 
 
 from ckan.plugins.core import SingletonPlugin, implements
@@ -336,7 +337,7 @@ class DataVerseHarvester(HarvesterBase, SingletonPlugin):
             package_dict["owner_org"] = owner_org
 
             # add license
-            package_dict["license_id"] = self._extract_license_id(content)
+            apply_license(package_dict, content.get("rights"), context)
 
             # add resources
             url = self._get_possible_resource(harvest_object, content)
@@ -407,9 +408,6 @@ class DataVerseHarvester(HarvesterBase, SingletonPlugin):
 
     def _extract_author(self, content):
         return ", ".join(content["creator"])
-
-    def _extract_license_id(self, content):
-        return ", ".join(content["rights"])
 
     def _extract_tags_and_extras(self, content):
         extras = []

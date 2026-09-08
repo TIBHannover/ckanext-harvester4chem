@@ -11,6 +11,7 @@ import requests
 
 from ckan.model import Session
 from ckan.logic import get_action
+from ckanext.harvester4chem.license_utils import apply_license
 from ckan import model
 
 from ckanext.harvester4chem.molecule_sync import synchronize_harvested_package
@@ -176,12 +177,7 @@ class NMRxIVBioSchema(HarvesterBase):
                 log.exception(f'description not available {e}')
                 package_dict['notes'] = ''
                 pass
-            try:
-                package_dict["license_id"] = self._extract_license_id(context=context, content=content)
-                log.debug(f'This is the license {package_dict["license_id"]}')
-            except Exception as e:
-                log.exception(f'License Error: {e}')
-                pass
+            apply_license(package_dict, content.get("license"), context)
 
             self._extract_extras_image(package=package_dict, content_hasBioPart=content)
 
@@ -474,15 +470,3 @@ class NMRxIVBioSchema(HarvesterBase):
             pass
 
         return None
-
-    def _extract_license_id(self, context, content):
-        package_license = None
-        content_license = content['license']
-        license_list = get_action('license_list')(context.copy(), {})
-        for license_name in license_list:
-
-            if content_license == license_name['id'] or content_license == license_name['url'] or content_license == \
-                    license_name['title']:
-                package_license = license_name['id']
-
-        return package_license
