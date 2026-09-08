@@ -59,12 +59,18 @@ def _cc_alias(value):
     """Allow CC identifier spacing, never arbitrary name punctuation changes.
 
     The old OAI matcher accepted arbitrary suffixes after CC IDs. Limit suffix
-    support to parenthetical descriptions instead of unrestricted startswith.
+    support to parenthetical descriptions and the observed Deed/Legal Code
+    labels instead of unrestricted startswith. CC0's Universal label is also
+    accepted without changing its version.
     This recognizes notation only: the ID must still exist in license_list.
     """
+    value = value.strip()
+    if re.fullmatch(r'CC0[ -]+1\.0(?:\s+Universal)?', value, re.IGNORECASE):
+        return 'cc0-1.0'
     match = re.fullmatch(
-        r'(CC(?:[ -]+[A-Z]+)+[ -]+\d+\.\d+)(?:\s+\([^()]*\))?',
-        value.strip(), re.IGNORECASE)
+        r'(CC(?:[ -]+[A-Z]+)+[ -]+\d+\.\d+)'
+        r'(?:\s+\([^()]*\)|\s+Deed|\s+Legal Code)?',
+        value, re.IGNORECASE)
     return re.sub(r'[ -]+', '-', match.group(1)).casefold() if match else None
 
 

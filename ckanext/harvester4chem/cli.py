@@ -1782,3 +1782,51 @@ def cleanup_inactive_relationships_command(dry_run, apply_mode, manifest,
 
 def get_commands():
     return [harvester4chem]
+
+
+@harvester4chem.command(name="repair-licenses")
+@click.option("--source", type=click.Choice(["chemotion", "nmrxiv", "massbank", "all"]))
+@click.option("--dry-run", is_flag=True, help="Resolve/report only; no package writes.")
+@click.option("--run", "run_mode", is_flag=True, help="Patch only resolved license_id values.")
+@click.option("--limit", type=click.IntRange(min=0))
+@click.option("--offset", type=click.IntRange(min=0), default=0)
+@click.option("--batch-size", type=click.IntRange(min=1), default=100, show_default=True,
+              help="Report checkpoint/progress interval; package actions commit individually.")
+@click.option("--dataset", help="Exactly one CKAN package name.")
+@click.option("--manifest", type=click.Path(exists=True, dir_okay=False))
+@click.option("--output-dir", type=click.Path(file_okay=False), help="Parent for a new timestamped run directory.")
+@click.option("--resume", type=click.Path(exists=True, file_okay=False))
+@click.option("--include-malformed", is_flag=True, default=None)
+@click.option("--missing-only", is_flag=True, help="Default: select missing licenses only.")
+def repair_licenses_command(source, dry_run, run_mode, limit, offset, batch_size,
+                            dataset, manifest, output_dir, resume,
+                            include_malformed, missing_only):
+    """Repair historical dataset licenses without harvesting or chemistry sync."""
+    if dry_run == run_mode:
+        raise click.UsageError("exactly one of --dry-run or --run is required")
+    if dataset and manifest:
+        raise click.UsageError("--dataset and --manifest are mutually exclusive")
+    if missing_only and include_malformed:
+        raise click.UsageError("--missing-only and --include-malformed are mutually exclusive")
+    if dataset and (limit is not None or offset):
+        raise click.UsageError("--dataset processes exactly one name; do not combine with limit/offset")
+    if resume and (dataset or manifest or limit is not None or offset or output_dir):
+        raise click.UsageError("--resume uses the original candidate snapshot")
+    from ckanext.harvester4chem.license_repair import Store, MetadataClient, execute, read_manifest
+    try:
+        names = [dataset] if dataset else read_manifest(manifest) if manifest else None
+        context = {"model": model, "session": model.Session, "user": "harvest",
+                   "auth_user_obj": None, "ignore_auth": True}
+        _, summary = execute(
+            Store(model.Session, toolkit.get_action, context), MetadataClient(),
+            "run" if run_mode else "dry-run", source=source,
+            malformed=False if missing_only else include_malformed,
+            names=names, limit=limit, offset=offset, batch_size=batch_size,
+            output_dir=output_dir, resume=resume,
+            site=toolkit.config.get('ckan.site_url', ''), emit=click.echo)
+        if summary['state'] == 'interrupted':
+            raise click.ClickException("interrupted; resume using the printed report directory")
+        if summary.get('counts', {}).get('failed'):
+            raise click.ClickException("some datasets failed; inspect failed.csv in the report directory")
+    except (ValueError, OSError) as error:
+        raise click.ClickException(str(error))

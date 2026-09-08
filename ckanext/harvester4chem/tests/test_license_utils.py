@@ -55,6 +55,29 @@ class LicenseTests(unittest.TestCase):
         self.assertEqual(licenses.resolve_license_id(
             'https://creativecommons.org/licenses/by-sa/4.0', {}), 'CC BY-SA 4.0')
 
+    def test_observed_legacy_labels_resolve_only_to_registered_ids(self):
+        pairs = [
+            ('CC BY 4.0 Deed', 'CC-BY-4.0'),
+            ('CC0 1.0 Universal ', 'CC0-1.0'),
+            ('CC BY-NC-SA 4.0 Deed', 'CC-BY-NC-SA-4.0'),
+            ('CC BY-NC-ND 4.0 Legal Code', 'CC-BY-NC-ND-4.0'),
+            ('CC BY-SA 4.0 Deed ', 'CC BY-SA 4.0'),
+            ('CC BY-NC 4.0 Deed', 'CC BY-NC 4.0'),
+            ('CC BY-ND 4.0 Deed', 'CC-BY-ND-4.0'),
+        ]
+        for source, target in pairs:
+            with self.subTest(source=source):
+                self.entries[:] = [{'id': target, 'url': '', 'title': ''}]
+                self.assertEqual(licenses.resolve_license_id(source, {}), target)
+                self.entries.clear()
+                with self.assertLogs(licenses.log, level='WARNING'):
+                    self.assertIsNone(licenses.resolve_license_id(source, {}))
+
+    def test_legacy_aliases_do_not_accept_modified_terms(self):
+        for source in ('CC BY 4.0 Deed modified', 'CC0 1.0 Universal with exceptions'):
+            with self.assertLogs(licenses.log, level='WARNING'):
+                self.assertIsNone(licenses.resolve_license_id(source, {}))
+
     def test_representations(self):
         for source in [
             'CC-BY-4.0', 'cc-by-4.0',
