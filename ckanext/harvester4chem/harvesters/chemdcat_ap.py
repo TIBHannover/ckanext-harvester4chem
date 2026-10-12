@@ -1,23 +1,15 @@
-"""CKAN harvester for Chemotion's ChemDCAT-AP API.
-
-Set the harvest source URL to either the Chemotion Swagger UI URL
-(.../swagger_doc#/ChemDCAT-AP) or the API base URL (.../api/v1/public).
-The publications and record endpoints are derived from that URL, so no
-metadata_endpoint setting is required. Optional source config can override
-pagination/type settings; an empty config is valid. The original JSON-LD
-document is preserved in the CKAN package extra named chemdcat_ap.
-"""
+"""CKAN harvester for Chemotion's ChemDCAT-AP API (v4)."""
 import json
 import logging
 import re
 import time
 import traceback
+import uuid
 from urllib.parse import parse_qs, urlparse
 
 import requests
 from ckan import model
 from ckan.lib.munge import munge_tag, munge_title_to_name
-from ckan.lib.search import rebuild
 from ckan.logic import get_action
 from ckan.model import Session
 from ckanext.harvest.harvesters.base import HarvesterBase
@@ -45,8 +37,6 @@ class ChemDCATAPHarvester(HarvesterBase):
         if not supplied_url:
             raise ValueError("Set the Chemotion Swagger URL or API base URL as the harvest source URL")
         parsed_url = urlparse(supplied_url)
-        # The CKAN source may be set to the Swagger UI itself. Use only its
-        # origin in that case; API operations are below /api/v1/public.
         if parsed_url.path.rstrip("/").endswith("/swagger_doc"):
             base = parsed_url.scheme + "://" + parsed_url.netloc + "/api/v1/public"
         else:
@@ -67,16 +57,11 @@ class ChemDCATAPHarvester(HarvesterBase):
             public_base = base + "/api/v1/public"
             default_listing = public_base + "/metadata/publications"
         listing = config.get("publications_endpoint") or default_listing
-        metadata_endpoint = public_base + "/metadata/chemdcat"
-        if not listing:
-            raise ValueError("Set publications_endpoint or the harvest source URL")
-        return config, listing, metadata_endpoint
+        return config, listing, public_base + "/metadata/chemdcat"
 
     @staticmethod
     def _record_identifier(item):
-        """Return the supported query parameter and value for one list item."""
         if isinstance(item, dict):
-            # Avoid using generic nested element IDs as publication IDs.
             for key in ("publication_id", "publication-id", "publicationId"):
                 if item.get(key) is not None:
                     return "publication_id", str(item[key])
@@ -116,7 +101,6 @@ class ChemDCATAPHarvester(HarvesterBase):
 
     @staticmethod
     def _get_response(url, params, timeout, retries=3, backoff=2):
-        """GET with bounded retries for API rate limits and temporary errors."""
         for attempt in range(retries + 1):
             response = requests.get(
                 url, params=params, timeout=timeout,
@@ -139,8 +123,6 @@ class ChemDCATAPHarvester(HarvesterBase):
         try:
             config, endpoint, _ = self._config(harvest_job.source)
             initial_offset = int(config.get("offset", 0))
-            # Match the existing Chemotion harvester: request pages of up to
-            # 1000 records, then advance offset by exactly that page size.
             limit = int(config.get("limit", 1000))
             timeout = float(config.get("timeout", 30))
             retries = int(config.get("retries", 3))
@@ -153,8 +135,6 @@ class ChemDCATAPHarvester(HarvesterBase):
             if config.get("date_to"):
                 list_params["date_to"] = config["date_to"]
             else:
-                # An empty date_to means no upper date bound, as in the
-                # existing Chemotion harvester's configuration.
                 list_params.pop("date_to", None)
             if "types" in config:
                 types = config["types"]
@@ -162,16 +142,14 @@ class ChemDCATAPHarvester(HarvesterBase):
                 types = [config["type_chem"]]
             else:
                 types = ["Container"]
+
             ids, seen = [], set()
             for publication_type in types:
                 offset = initial_offset
                 while True:
                     params = dict(list_params)
-                    params.update({
-                        "type": publication_type,
-                        "offset": offset,
-                        "limit": limit,
-                    })
+                    params.update({"type": publication_type,
+                                   "offset": offset, "limit": limit})
                     response = self._get_response(
                         endpoint, params, timeout, retries=retries, backoff=backoff)
                     records = self._records(response.json())
@@ -187,13 +165,14 @@ class ChemDCATAPHarvester(HarvesterBase):
                     if len(records) < limit:
                         break
                     offset += limit
-            result = []
-            for identifier in ids:
-                obj = HarvestObject(guid=identifier, job=harvest_job)
-                obj.save()
-                result.append(obj.id)
-            log.info("Gathered %d Chemotion publication identifiers", len(result))
-            return result
+
+            object_ids = []
+            for guid in ids:
+                harvest_object = HarvestObject(guid=guid, job=harvest_job)
+                harvest_object.save()
+                object_ids.append(harvest_object.id)
+            log.info("Gathered %d Chemotion publication identifiers", len(object_ids))
+            return object_ids
         except Exception as exc:
             log.exception("ChemDCAT-AP gather failed")
             self._save_gather_error(
@@ -203,7 +182,7 @@ class ChemDCATAPHarvester(HarvesterBase):
 
     def fetch_stage(self, harvest_object):
         try:
-            config, _, template = self._config(harvest_object.source)
+            config, _, endpoint = self._config(harvest_object.source)
             guid = str(harvest_object.guid)
             if ":" in guid:
                 query_parameter, identifier = guid.split(":", 1)
@@ -212,7 +191,7 @@ class ChemDCATAPHarvester(HarvesterBase):
             if query_parameter not in ("publication_id", "inchikey"):
                 raise ValueError("Unsupported Chemotion record identifier")
             response = self._get_response(
-                template, {query_parameter: identifier},
+                endpoint, {query_parameter: identifier},
                 float(config.get("timeout", 30)),
                 retries=int(config.get("retries", 3)),
                 backoff=float(config.get("retry_backoff", 2)))
@@ -267,7 +246,12 @@ class ChemDCATAPHarvester(HarvesterBase):
             landing = self._value(content, "landing_page", "landingPage", "url")
             if isinstance(landing, dict):
                 landing = landing.get("id") or landing.get("@id")
+            # CKAN harvest's base helper requires a stable remote dataset id.
+            # Use the source + gathered GUID so every rerun updates this record.
+            remote_key = "%s:%s" % (harvest_object.source.id, harvest_object.guid)
+            package_id = str(uuid.uuid5(uuid.NAMESPACE_URL, remote_key))
             package = {
+                "id": package_id,
                 "name": name,
                 "title": title,
                 "notes": self._text(self._value(content, "description", "abstract")) or "",
@@ -285,9 +269,11 @@ class ChemDCATAPHarvester(HarvesterBase):
 
             license_value = self._text(self._value(content, "license", "license_id"))
             if license_value:
-                for lic in get_action("license_list")(context.copy(), {}):
-                    if license_value in (lic.get("id"), lic.get("url"), lic.get("title")):
-                        package["license_id"] = lic["id"]
+                for license_item in get_action("license_list")(context.copy(), {}):
+                    if license_value in (license_item.get("id"),
+                                         license_item.get("url"),
+                                         license_item.get("title")):
+                        package["license_id"] = license_item["id"]
                         break
             publisher = self._value(content, "publisher", "maintainer")
             author = self._value(content, "creator", "author", "authors")
@@ -300,10 +286,13 @@ class ChemDCATAPHarvester(HarvesterBase):
             if modified:
                 package["metadata_modified"] = self._text(modified)
 
-            self._create_or_update_package(package, harvest_object, "package_show")
-            Session.commit()
-            rebuild(package["name"])
-            return True
+            result = self._create_or_update_package(
+                package, harvest_object, "package_show")
+            if result is None or result is False:
+                return False
+            # _create_or_update_package returns True for a change and
+            # 'unchanged' when the existing record already matches.
+            return result
         except Exception as exc:
             Session.rollback()
             log.exception("ChemDCAT-AP import failed for %s", harvest_object.guid)
