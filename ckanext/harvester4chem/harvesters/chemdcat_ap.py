@@ -90,6 +90,11 @@ class ChemDCATAPHarvester(HarvesterBase):
         raise ValueError("Listing response must contain a publication list")
 
     def gather_stage(self, harvest_job):
+        """
+        Gather stage
+        :param harvest_job:
+        :return:
+        """
         try:
             config, endpoint, _ = self._config(harvest_job.source)
             offset = int(config.get("offset", 0))
@@ -275,3 +280,4 @@ class ChemDCATAPHarvester(HarvesterBase):
             if landing and str(landing).startswith(("http://", "https://")):
                 resources.append({"url": landing, "name": title, "format": "HTML"})
         return resources
+    # Test Send docs
