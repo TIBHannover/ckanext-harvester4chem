@@ -454,7 +454,13 @@ class ChemDCATAPHarvester(HarvesterBase):
                     extra_values["license_uri"] = license_uri
             for key, value in extra_values.items():
                 if value not in (None, "", [], {}):
-                    extras.append({"key": key, "value": str(value)})
+                    # Chemical fields such as doi/inchi/smiles are custom
+                    # schema fields in this CKAN instance. Repeating them as
+                    # extras makes package_create reject the dataset. Keep
+                    # their top-level values below, and namespace supplemental
+                    # copies so they cannot collide with CKAN schema fields.
+                    extra_key = "harvester4chem_" + key
+                    extras.append({"key": extra_key, "value": str(value)})
 
             # CKAN harvest's base helper requires a stable remote dataset id.
             # Use the source + gathered GUID so every rerun updates this record.
