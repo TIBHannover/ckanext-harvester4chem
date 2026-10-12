@@ -1,22 +1,18 @@
 """CKAN harvester for Chemotion's ChemDCAT-AP API.
 
-Source config:
-{
-  "publications_endpoint": "https://www.chemotion-repository.net/api/v1/public/publications",
-  "metadata_endpoint": "https://www.chemotion-repository.net/api/v1/public/publications/{publication_id}/chemdcat_ap",
-  "offset": 0,
-  "limit": 100
-}
-
-Set the two endpoint URLs to the paths shown in the Chemotion Swagger UI.
-The record endpoint must contain {publication_id}. The original profile JSON
-is preserved in the CKAN package extra named chemdcat_ap.
+Set the harvest source URL to either the Chemotion Swagger UI URL
+(.../swagger_doc#/ChemDCAT-AP) or the API base URL (.../api/v1/public).
+The publications and record endpoints are derived from that URL, so no
+metadata_endpoint setting is required. Optional source config can override
+pagination/type settings; an empty config is valid. The original JSON-LD
+document is preserved in the CKAN package extra named chemdcat_ap.
 """
 import json
 import logging
 import re
 import traceback
-from urllib.parse import parse_qs, quote, urlparse
+from datetime import date
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from ckan import model
@@ -45,39 +41,68 @@ class ChemDCATAPHarvester(HarvesterBase):
             raise ValueError("Harvester configuration must be valid JSON") from exc
         if not isinstance(config, dict):
             raise ValueError("Harvester configuration must be a JSON object")
-        listing = config.get("publications_endpoint") or source.url
-        template = config.get("metadata_endpoint")
+        supplied_url = (config.get("api_base_url") or source.url or "").rstrip("/")
+        if not supplied_url:
+            raise ValueError("Set the Chemotion Swagger URL or API base URL as the harvest source URL")
+        parsed_url = urlparse(supplied_url)
+        # The CKAN source may be set to the Swagger UI itself. Use only its
+        # origin in that case; API operations are below /api/v1/public.
+        if parsed_url.path.rstrip("/").endswith("/swagger_doc"):
+            base = parsed_url.scheme + "://" + parsed_url.netloc + "/api/v1/public"
+        else:
+            base = supplied_url
+        if base.endswith("/metadata/publications"):
+            public_base = base.rsplit("/metadata/publications", 1)[0]
+            default_listing = base
+        elif base.endswith("/metadata"):
+            public_base = base.rsplit("/metadata", 1)[0]
+            default_listing = base + "/publications"
+        elif base.endswith("/api/v1/public"):
+            public_base = base
+            default_listing = base + "/metadata/publications"
+        elif not parsed_url.path or parsed_url.path == "/":
+            public_base = base + "/api/v1/public"
+            default_listing = public_base + "/metadata/publications"
+        else:
+            public_base = base + "/api/v1/public"
+            default_listing = public_base + "/metadata/publications"
+        listing = config.get("publications_endpoint") or default_listing
+        metadata_endpoint = public_base + "/metadata/chemdcat"
         if not listing:
             raise ValueError("Set publications_endpoint or the harvest source URL")
-        if not template or "{publication_id}" not in template:
-            raise ValueError("metadata_endpoint must contain {publication_id}")
-        return config, listing, template
+        return config, listing, metadata_endpoint
 
     @staticmethod
-    def _publication_id(item):
+    def _record_identifier(item):
+        """Return the supported query parameter and value for one list item."""
         if isinstance(item, dict):
-            for key in ("publication_id", "publication-id", "publicationId",
-                        "id", "identifier", "url", "@id"):
+            # Avoid using generic nested element IDs as publication IDs.
+            for key in ("publication_id", "publication-id", "publicationId"):
                 if item.get(key) is not None:
-                    result = ChemDCATAPHarvester._publication_id(item[key])
-                    if result:
+                    return "publication_id", str(item[key])
+            for key in ("url", "@id", "identifier"):
+                if item.get(key) is not None:
+                    result = ChemDCATAPHarvester._record_identifier(item[key])
+                    if result[1]:
                         return result
-            return None
+            return None, None
         if isinstance(item, (int, float)):
-            return str(int(item))
+            return "publication_id", str(int(item))
         if not isinstance(item, str) or not item.strip():
-            return None
+            return None, None
         value = item.strip()
         query = parse_qs(urlparse(value).query)
-        for key in ("publication-id", "publication_id", "publicationId", "id"):
+        for key in ("publication_id", "publication-id", "publicationId"):
             if query.get(key):
-                return query[key][0]
+                return "publication_id", query[key][0]
+        if query.get("inchikey"):
+            return "inchikey", query["inchikey"][0]
         match = re.search(r"/pid/([^/?#]+)", value)
         if match:
-            return match.group(1)
+            return "publication_id", match.group(1)
         if value.startswith(("http://", "https://")):
-            return urlparse(value).path.rstrip("/").rsplit("/", 1)[-1] or None
-        return value
+            return None, None
+        return "publication_id", value
 
     @staticmethod
     def _records(payload):
@@ -90,58 +115,79 @@ class ChemDCATAPHarvester(HarvesterBase):
         raise ValueError("Listing response must contain a publication list")
 
     def gather_stage(self, harvest_job):
-        """
-        Gather stage
-        :param harvest_job:
-        :return:
-        """
         try:
             config, endpoint, _ = self._config(harvest_job.source)
-            offset = int(config.get("offset", 0))
+            initial_offset = int(config.get("offset", 0))
             limit = int(config.get("limit", 100))
             timeout = float(config.get("timeout", 30))
-            if offset < 0 or limit < 1:
-                raise ValueError("offset must be >= 0 and limit must be > 0")
-            list_params = config.get("list_params") or {}
+            if initial_offset < 0 or limit < 1 or limit > 1000:
+                raise ValueError("offset must be >= 0 and limit must be between 1 and 1000")
+            list_params = dict(config.get("list_params") or {})
+            list_params.setdefault("date_from", config.get("date_from", "1971-01-01"))
+            list_params.setdefault("date_to", config.get("date_to", date.today().isoformat()))
+            if "types" in config:
+                types = config["types"]
+            elif config.get("type_chem"):
+                types = [config["type_chem"]]
+            else:
+                # ChemDCAT-AP endpoint supports both analysis/container and
+                # reaction publications.
+                types = ["Container", "Reaction"]
             ids, seen = [], set()
-            while True:
-                params = dict(list_params)
-                params.update({"offset": offset, "limit": limit})
-                response = requests.get(endpoint, params=params, timeout=timeout,
-                                        headers={"Accept": "application/json"})
-                response.raise_for_status()
-                records = self._records(response.json())
-                if not records:
-                    break
-                for item in records:
-                    publication_id = self._publication_id(item)
-                    if publication_id and publication_id not in seen:
-                        ids.append(publication_id)
-                        seen.add(publication_id)
-                if len(records) < limit:
-                    break
-                offset += limit
+            for publication_type in types:
+                offset = initial_offset
+                while True:
+                    params = dict(list_params)
+                    params.update({
+                        "type": publication_type,
+                        "offset": offset,
+                        "limit": limit,
+                    })
+                    response = requests.get(
+                        endpoint, params=params, timeout=timeout,
+                        headers={"Accept": "application/json"})
+                    response.raise_for_status()
+                    records = self._records(response.json())
+                    if not records:
+                        break
+                    for item in records:
+                        query_parameter, identifier = self._record_identifier(item)
+                        guid = ("%s:%s" % (query_parameter, identifier)
+                                if identifier else None)
+                        if guid and guid not in seen:
+                            ids.append(guid)
+                            seen.add(guid)
+                    if len(records) < limit:
+                        break
+                    offset += limit
             result = []
-            for publication_id in ids:
-                obj = HarvestObject(guid=publication_id, job=harvest_job)
+            for identifier in ids:
+                obj = HarvestObject(guid=identifier, job=harvest_job)
                 obj.save()
                 result.append(obj.id)
-            log.info("Gathered %d Chemotion publication IDs", len(result))
+            log.info("Gathered %d Chemotion publication identifiers", len(result))
             return result
         except Exception as exc:
             log.exception("ChemDCAT-AP gather failed")
             self._save_gather_error(
-                "Could not gather publication IDs: %s / %s" %
+                "Could not gather publication identifiers: %s / %s" %
                 (exc, traceback.format_exc()), harvest_job)
             return None
 
     def fetch_stage(self, harvest_object):
         try:
             config, _, template = self._config(harvest_object.source)
-            url = template.format(
-                publication_id=quote(str(harvest_object.guid), safe=""))
+            guid = str(harvest_object.guid)
+            if ":" in guid:
+                query_parameter, identifier = guid.split(":", 1)
+            else:
+                query_parameter, identifier = "publication_id", guid
+            if query_parameter not in ("publication_id", "inchikey"):
+                raise ValueError("Unsupported Chemotion record identifier")
             response = requests.get(
-                url, timeout=float(config.get("timeout", 30)),
+                template,
+                params={query_parameter: identifier},
+                timeout=float(config.get("timeout", 30)),
                 headers={"Accept": "application/ld+json, application/json"})
             response.raise_for_status()
             content = response.json()
@@ -280,4 +326,3 @@ class ChemDCATAPHarvester(HarvesterBase):
             if landing and str(landing).startswith(("http://", "https://")):
                 resources.append({"url": landing, "name": title, "format": "HTML"})
         return resources
-    # Test Send docs
