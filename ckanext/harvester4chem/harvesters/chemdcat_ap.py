@@ -10,8 +10,8 @@ document is preserved in the CKAN package extra named chemdcat_ap.
 import json
 import logging
 import re
+import time
 import traceback
-from datetime import date
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -114,25 +114,54 @@ class ChemDCATAPHarvester(HarvesterBase):
                     return payload[key]
         raise ValueError("Listing response must contain a publication list")
 
+    @staticmethod
+    def _get_response(url, params, timeout, retries=3, backoff=2):
+        """GET with bounded retries for API rate limits and temporary errors."""
+        for attempt in range(retries + 1):
+            response = requests.get(
+                url, params=params, timeout=timeout,
+                headers={"Accept": "application/ld+json, application/json"})
+            if response.status_code not in (429, 500, 502, 503, 504):
+                response.raise_for_status()
+                return response
+            if attempt >= retries:
+                response.raise_for_status()
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else backoff * (2 ** attempt)
+            except (TypeError, ValueError):
+                delay = backoff * (2 ** attempt)
+            log.warning("Chemotion returned HTTP %s; retrying in %.1f seconds",
+                        response.status_code, delay)
+            time.sleep(delay)
+
     def gather_stage(self, harvest_job):
         try:
             config, endpoint, _ = self._config(harvest_job.source)
             initial_offset = int(config.get("offset", 0))
-            limit = int(config.get("limit", 100))
+            # Match the existing Chemotion harvester: request pages of up to
+            # 1000 records, then advance offset by exactly that page size.
+            limit = int(config.get("limit", 1000))
             timeout = float(config.get("timeout", 30))
+            retries = int(config.get("retries", 3))
+            backoff = float(config.get("retry_backoff", 2))
             if initial_offset < 0 or limit < 1 or limit > 1000:
                 raise ValueError("offset must be >= 0 and limit must be between 1 and 1000")
             list_params = dict(config.get("list_params") or {})
-            list_params.setdefault("date_from", config.get("date_from", "1971-01-01"))
-            list_params.setdefault("date_to", config.get("date_to", date.today().isoformat()))
+            if "date_from" in config:
+                list_params["date_from"] = config["date_from"]
+            if config.get("date_to"):
+                list_params["date_to"] = config["date_to"]
+            else:
+                # An empty date_to means no upper date bound, as in the
+                # existing Chemotion harvester's configuration.
+                list_params.pop("date_to", None)
             if "types" in config:
                 types = config["types"]
             elif config.get("type_chem"):
                 types = [config["type_chem"]]
             else:
-                # ChemDCAT-AP endpoint supports both analysis/container and
-                # reaction publications.
-                types = ["Container", "Reaction"]
+                types = ["Container"]
             ids, seen = [], set()
             for publication_type in types:
                 offset = initial_offset
@@ -143,10 +172,8 @@ class ChemDCATAPHarvester(HarvesterBase):
                         "offset": offset,
                         "limit": limit,
                     })
-                    response = requests.get(
-                        endpoint, params=params, timeout=timeout,
-                        headers={"Accept": "application/json"})
-                    response.raise_for_status()
+                    response = self._get_response(
+                        endpoint, params, timeout, retries=retries, backoff=backoff)
                     records = self._records(response.json())
                     if not records:
                         break
@@ -184,12 +211,11 @@ class ChemDCATAPHarvester(HarvesterBase):
                 query_parameter, identifier = "publication_id", guid
             if query_parameter not in ("publication_id", "inchikey"):
                 raise ValueError("Unsupported Chemotion record identifier")
-            response = requests.get(
-                template,
-                params={query_parameter: identifier},
-                timeout=float(config.get("timeout", 30)),
-                headers={"Accept": "application/ld+json, application/json"})
-            response.raise_for_status()
+            response = self._get_response(
+                template, {query_parameter: identifier},
+                float(config.get("timeout", 30)),
+                retries=int(config.get("retries", 3)),
+                backoff=float(config.get("retry_backoff", 2)))
             content = response.json()
             if not isinstance(content, dict):
                 raise ValueError("Record response must be a JSON object")
