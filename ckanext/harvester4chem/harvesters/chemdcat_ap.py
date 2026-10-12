@@ -1,4 +1,4 @@
-"""CKAN harvester for Chemotion's ChemDCAT-AP API (v4)."""
+"""CKAN harvester for Chemotion's ChemDCAT-AP API (v5)."""
 import json
 import logging
 import re
@@ -209,12 +209,185 @@ class ChemDCATAPHarvester(HarvesterBase):
             return False
 
     @staticmethod
-    def _value(content, *keys):
-        for key in keys:
-            value = content.get(key)
-            if value not in (None, "", [], {}):
-                return value
+    def _key_token(key):
+        """Normalize JSON-LD compact terms and schema slot names."""
+        local = str(key).rsplit("#", 1)[-1].rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        return re.sub(r"[^a-z0-9]", "", local.lower())
+
+    @staticmethod
+    def _walk_nodes(value):
+        if isinstance(value, dict):
+            yield value
+            for key, child in value.items():
+                if key != "@context" and isinstance(child, (dict, list)):
+                    for node in ChemDCATAPHarvester._walk_nodes(child):
+                        yield node
+        elif isinstance(value, list):
+            for child in value:
+                for node in ChemDCATAPHarvester._walk_nodes(child):
+                    yield node
+
+    @classmethod
+    def _all_values(cls, content, *keys):
+        wanted = set(cls._key_token(key) for key in keys)
+        values = []
+        for node in cls._walk_nodes(content):
+            for key, value in node.items():
+                if (key != "@context" and cls._key_token(key) in wanted and
+                        value not in (None, "", [], {})):
+                    values.append(value)
+        return values
+
+    @classmethod
+    def _value(cls, content, *keys):
+        if isinstance(content, dict):
+            for key in keys:
+                value = content.get(key)
+                if value not in (None, "", [], {}):
+                    return value
+        values = cls._all_values(content, *keys)
+        return values[0] if values else None
+
+    @classmethod
+    def _dataset_node(cls, content):
+        for node in cls._walk_nodes(content):
+            types = cls._strings(node.get("@type") or node.get("type"))
+            if any(cls._key_token(value).endswith("dataset") for value in types):
+                return node
+        for node in cls._walk_nodes(content):
+            if node.get("distribution") or node.get("distributions"):
+                return node
+        return content
+
+    @classmethod
+    def _doi(cls, content):
+        # Prefer explicit DOI fields, then inspect the dataset identifiers.
+        values = cls._all_values(content, "doi", "publication_doi", "identifier",
+                                 "other_identifier", "id", "@id")
+        pattern = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+        for value in values:
+            for text in cls._strings(value):
+                match = pattern.search(text)
+                if match:
+                    return match.group(0).rstrip(".,;:)]")
         return None
+
+    @classmethod
+    def _strings(cls, value):
+        if isinstance(value, dict):
+            preferred = ("@id", "id", "url", "value", "name", "title",
+                         "label", "identifier", "@value")
+            ordered = []
+            for wanted in preferred:
+                ordered.extend(v for k, v in value.items()
+                               if cls._key_token(k) == cls._key_token(wanted))
+            ordered.extend(v for k, v in value.items()
+                           if k != "@context" and v not in ordered)
+            result = []
+            for child in ordered:
+                result.extend(cls._strings(child))
+            return result
+        if isinstance(value, (list, tuple)):
+            result = []
+            for child in value:
+                result.extend(cls._strings(child))
+            return result
+        return [str(value)] if value is not None else []
+
+    @classmethod
+    def _license_candidates(cls, content):
+        values = cls._all_values(content, "license", "license_id", "rights",
+                                 "accessRights", "access_rights")
+        candidates = []
+        for value in values:
+            for candidate in cls._strings(value):
+                candidate = candidate.strip()
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+        return candidates
+
+    @staticmethod
+    def _license_token(value):
+        value = str(value or "").strip().lower()
+        value = re.sub(r"^https?://", "", value)
+        value = value.removeprefix("www.") if hasattr(value, "removeprefix") else re.sub(r"^www\.", "", value)
+        return re.sub(r"[^a-z0-9]", "", value)
+
+    @classmethod
+    def _license_id_for(cls, candidates, license_items):
+        aliases = {
+            "creativecommonsattribution40": "cc-by",
+            "creativecommonsattribution30": "cc-by",
+            "ccby40": "cc-by", "ccby30": "cc-by",
+            "creativecommonsattributionsharealike40": "cc-by-sa",
+            "ccbysa40": "cc-by-sa",
+            "creativecommonsattributionnoncommercial40": "cc-by-nc",
+            "ccbync40": "cc-by-nc",
+            "creativecommonsattributionnoncommercialsharealike40": "cc-by-nc-sa",
+            "ccbyncsa40": "cc-by-nc-sa",
+            "creativecommonsattributionnoderivatives40": "cc-by-nd",
+            "ccbynd40": "cc-by-nd",
+            "creativecommonsattributionnoncommercialnoderivatives40": "cc-by-nc-nd",
+            "ccbyncnd40": "cc-by-nc-nd",
+            "creativecommonspublicdomainzero10": "cc-zero",
+            "creativecommonsorgpublicdomainzero10": "cc-zero",
+            "cc0": "cc-zero",
+            "cc010": "cc-zero",
+        }
+        for candidate in candidates:
+            token = cls._license_token(candidate)
+            normalized_candidate = candidate.lower().rstrip("/")
+            mapped = aliases.get(token)
+            if "creativecommons.org/licenses/" in normalized_candidate:
+                slug = normalized_candidate.split("creativecommons.org/licenses/", 1)[1].strip("/")
+                if slug.startswith("publicdomain/zero/"):
+                    mapped = "cc-zero"
+                elif slug.startswith("by/"):
+                    mapped = "cc-by"
+                elif slug.startswith("by-"):
+                    variant = slug.split("/", 1)[0][3:]
+                    mapped = "cc-by-" + variant
+            if "creativecommons.org/publicdomain/zero/" in normalized_candidate:
+                mapped = "cc-zero"
+            for item in license_items:
+                fields = (item.get("id"), item.get("url"), item.get("title"))
+                if any(cls._license_token(field) == token for field in fields if field):
+                    return item.get("id")
+                if mapped and item.get("id") == mapped:
+                    return mapped
+        return None
+
+    @classmethod
+    def _measurement_data(cls, content):
+        relation_fields = set((
+            "wasgeneratedby", "evaluatedentity", "evaluatedactivity", "realizedplan",
+            "carriedoutby", "hadinputentity", "hadoutputentity",
+            "hasquantitativeattribute", "hasqualitativeattribute",
+        ))
+        result = []
+        for node in cls._walk_nodes(content):
+            selected = {}
+            type_values = cls._strings(node.get("@type") or node.get("type"))
+            is_measurement = any(
+                "quantitativeattribute" in cls._key_token(value) or
+                "qualitativeattribute" in cls._key_token(value)
+                for value in type_values)
+            for key, value in node.items():
+                token = cls._key_token(key)
+                if (key != "@context" and value not in (None, "", [], {}) and
+                        (token in relation_fields or token.startswith("has") or
+                         (is_measurement and token in
+                          ("value", "unit", "title", "description", "hasquantitytype", "id", "@id")))):
+                    selected[key] = value
+            if selected:
+                subject = node.get("@id") or node.get("id")
+                record = {"properties": selected}
+                if subject:
+                    record["id"] = subject
+                if node.get("@type") or node.get("type"):
+                    record["type"] = node.get("@type") or node.get("type")
+                result.append(record)
+        return result
 
     @staticmethod
     def _text(value):
@@ -235,17 +408,54 @@ class ChemDCATAPHarvester(HarvesterBase):
             content = json.loads(harvest_object.content or "{}")
             if not isinstance(content, dict):
                 raise ValueError("Record content must be a JSON object")
+            dataset = self._dataset_node(content)
 
-            title = self._text(self._value(content, "title", "name", "label"))
+            title = self._text(self._value(dataset, "title", "name", "label"))
             title = title or "Chemotion publication %s" % harvest_object.guid
-            identifier = self._text(self._value(content, "id", "@id", "identifier"))
+            identifier = self._text(self._value(dataset, "id", "@id", "identifier"))
             name = munge_title_to_name(identifier or str(harvest_object.guid))
             if not name:
                 raise ValueError("Could not derive a CKAN package name")
 
-            landing = self._value(content, "landing_page", "landingPage", "url")
+            landing = self._value(dataset, "landing_page", "landingPage", "homepage")
             if isinstance(landing, dict):
                 landing = landing.get("id") or landing.get("@id")
+            doi = self._doi(dataset) or self._doi(content)
+            if not landing and doi:
+                landing = "https://doi.org/" + doi
+
+            resources = self._resources(content, title)
+            image_url = next((resource["url"] for resource in resources
+                              if "chemical image" in resource.get("name", "").lower()), None)
+            extras = [{"key": "chemdcat_ap",
+                       "value": json.dumps(content, ensure_ascii=False)}]
+            extra_values = {
+                "doi": doi,
+                "inchi": self._text(self._value(content, "inchi")),
+                "inchikey": self._text(self._value(content, "inchikey", "inchi_key")),
+                "inchi_key": self._text(self._value(content, "inchikey", "inchi_key")),
+                "smiles": self._text(self._value(content, "smiles", "canonical_smiles")),
+                "molecular_formula": self._text(self._value(content, "molecular_formula")),
+                "iupac_name": self._text(self._value(content, "iupac_name")),
+                "image_url": image_url,
+            }
+            measurement_data = self._measurement_data(content)
+            if measurement_data:
+                extra_values["chemdcat_measurement_data"] = json.dumps(
+                    measurement_data, ensure_ascii=False)
+            license_candidates = (self._license_candidates(dataset) or
+                                  self._license_candidates(content))
+            if license_candidates:
+                extra_values["chemdcat_license"] = json.dumps(
+                    license_candidates, ensure_ascii=False)
+                license_uri = next((item for item in license_candidates
+                                    if item.startswith(("http://", "https://"))), None)
+                if license_uri:
+                    extra_values["license_uri"] = license_uri
+            for key, value in extra_values.items():
+                if value not in (None, "", [], {}):
+                    extras.append({"key": key, "value": str(value)})
+
             # CKAN harvest's base helper requires a stable remote dataset id.
             # Use the source + gathered GUID so every rerun updates this record.
             remote_key = "%s:%s" % (harvest_object.source.id, harvest_object.guid)
@@ -254,30 +464,41 @@ class ChemDCATAPHarvester(HarvesterBase):
                 "id": package_id,
                 "name": name,
                 "title": title,
-                "notes": self._text(self._value(content, "description", "abstract")) or "",
+                "notes": self._text(self._value(dataset, "description", "abstract")) or "",
                 "url": self._text(landing) or "",
-                "extras": [{"key": "chemdcat_ap",
-                            "value": json.dumps(content, ensure_ascii=False)}],
+                "extras": extras,
                 "tags": self._tags(content),
-                "resources": self._resources(content, title),
+                "resources": resources,
             }
+            # These mirrors support installed CKAN chemical-structure plugins
+            # that look for package fields in addition to package extras.
+            for key in ("inchi", "inchikey", "inchi_key", "smiles",
+                        "molecular_formula", "iupac_name", "doi", "image_url"):
+                value = extra_values.get(key)
+                if value not in (None, "", [], {}):
+                    package[key] = value
             context = {"model": model, "session": Session, "user": "harvest",
                        "ignore_auth": True}
             source = get_action("package_show")(
                 context.copy(), {"id": harvest_object.source.id})
             package["owner_org"] = source.get("owner_org")
 
-            license_value = self._text(self._value(content, "license", "license_id"))
-            if license_value:
-                for license_item in get_action("license_list")(context.copy(), {}):
-                    if license_value in (license_item.get("id"),
-                                         license_item.get("url"),
-                                         license_item.get("title")):
-                        package["license_id"] = license_item["id"]
-                        break
+            if license_candidates:
+                try:
+                    license_items = get_action("license_list")(context.copy(), {})
+                    license_id = self._license_id_for(license_candidates, license_items)
+                    if license_id:
+                        package["license_id"] = license_id
+                    else:
+                        log.warning("No CKAN license matched Chemotion license %s",
+                                    license_candidates[0])
+                except Exception:
+                    # Keep the source license in extras even if the CKAN
+                    # license-list action is unavailable.
+                    log.exception("Could not map Chemotion license to CKAN license_id")
             publisher = self._value(content, "publisher", "maintainer")
             author = self._value(content, "creator", "author", "authors")
-            modified = self._value(content, "modified", "metadata_modified",
+            modified = self._value(dataset, "modified", "metadata_modified",
                                    "date_modified", "dateModified")
             if publisher:
                 package["maintainer"] = self._text(publisher)
@@ -304,8 +525,7 @@ class ChemDCATAPHarvester(HarvesterBase):
     def _tags(self, content):
         values = []
         for key in ("keyword", "keywords", "theme", "topic", "measurement_technique"):
-            value = content.get(key)
-            values.extend(value if isinstance(value, list) else ([value] if value else []))
+            values.extend(self._all_values(content, key))
         tags, seen = [], set()
         for value in values:
             label = self._text(value)
@@ -317,25 +537,59 @@ class ChemDCATAPHarvester(HarvesterBase):
         return tags
 
     def _resources(self, content, title):
-        values = self._value(content, "distribution", "distributions")
-        values = values if isinstance(values, list) else ([values] if values else [])
-        resources = []
-        for item in values:
+        resources, seen_urls = [], set()
+
+        def add_resource(item, default_name, default_format):
             if isinstance(item, str):
-                url, name, fmt = item, title, "HTML"
+                url = item
+                name = default_name
+                fmt = default_format
             elif isinstance(item, dict):
-                url = self._value(item, "download_url", "downloadURL",
-                                  "access_url", "accessURL", "url")
+                url = self._value(item, "download_url", "downloadURL", "access_url",
+                                  "accessURL", "url", "@id", "id", "value")
                 if isinstance(url, dict):
-                    url = url.get("id") or url.get("@id")
-                name = self._text(self._value(item, "title", "name")) or title
-                fmt = self._text(item.get("format")) or "Unknown"
+                    url = self._value(url, "@id", "id", "url", "value")
+                name = self._text(self._value(item, "title", "name")) or default_name
+                fmt = self._text(self._value(item, "encodingFormat", "mediaType",
+                                             "mimeType", "format")) or default_format
             else:
-                continue
-            if url and str(url).startswith(("http://", "https://")):
-                resources.append({"url": url, "name": name, "format": fmt})
+                return
+            if not url or not str(url).startswith(("http://", "https://")):
+                return
+            url = str(url)
+            if fmt.startswith("image/"):
+                fmt = fmt.split("/", 1)[1].upper()
+                if fmt == "JPG":
+                    fmt = "JPEG"
+            elif fmt == "image":
+                suffix = urlparse(url).path.rsplit(".", 1)
+                if len(suffix) == 2 and suffix[1]:
+                    fmt = suffix[1].upper()
+                    if fmt == "JPG":
+                        fmt = "JPEG"
+            if url in seen_urls:
+                return
+            seen_urls.add(url)
+            resources.append({"url": url, "name": name, "format": fmt})
+
+        # DCAT distributions can contain links to the actual measurement files.
+        for distribution in self._all_values(content, "distribution", "distributions"):
+            values = distribution if isinstance(distribution, list) else [distribution]
+            for item in values:
+                add_resource(item, title, "Unknown")
+
+        # Preserve externally hosted depiction/thumbnail links as image
+        # resources so CKAN image viewers can render them where supported.
+        image_keys = ("image", "image_url", "imageUrl", "thumbnail",
+                      "thumbnailUrl", "molecular_image", "chemical_structure_image",
+                      "depiction", "foaf:img")
+        for image_value in self._all_values(content, *image_keys):
+            values = image_value if isinstance(image_value, list) else [image_value]
+            for image_item in values:
+                add_resource(image_item, title + " - chemical image", "image")
+
         if not resources:
-            landing = self._value(content, "landing_page", "landingPage", "url")
+            landing = self._value(content, "landing_page", "landingPage", "homepage")
             if isinstance(landing, dict):
                 landing = landing.get("id") or landing.get("@id")
             if landing and str(landing).startswith(("http://", "https://")):
