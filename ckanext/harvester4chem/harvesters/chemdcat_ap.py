@@ -1,4 +1,4 @@
-"""CKAN harvester for Chemotion's ChemDCAT-AP API (v8)."""
+"""CKAN harvester for Chemotion's ChemDCAT-AP API (v9)."""
 import json
 import logging
 import os
@@ -477,6 +477,8 @@ class ChemDCATAPHarvester(HarvesterBase):
                 return None
             if not os.path.isfile(image_path):
                 Draw.MolToFile(molecule, image_path, size=(400, 400))
+            if not os.path.isfile(image_path) or os.path.getsize(image_path) == 0:
+                raise IOError("RDKit did not create a readable image file")
             return image_path
         except Exception:
             log.exception("Could not generate chemical depiction for %s", inchikey)
@@ -518,8 +520,6 @@ class ChemDCATAPHarvester(HarvesterBase):
                 landing = "https://doi.org/" + doi
 
             resources = self._resources(content, title)
-            image_url = next((resource["url"] for resource in resources
-                              if "chemical image" in resource.get("name", "").lower()), None)
             extras = [{"key": "chemdcat_ap",
                        "value": json.dumps(content, ensure_ascii=False)}]
             extra_values = {
@@ -530,7 +530,7 @@ class ChemDCATAPHarvester(HarvesterBase):
                 "smiles": self._text(self._value(content, "smiles", "canonical_smiles")),
                 "molecular_formula": self._text(self._value(content, "molecular_formula")),
                 "iupac_name": self._text(self._value(content, "iupac_name")),
-                "image_url": image_url,
+                "image_url": None,
                 "exactmass": self._molar_mass(content),
             }
             extra_values["mol_formula"] = extra_values["molecular_formula"]
@@ -539,6 +539,10 @@ class ChemDCATAPHarvester(HarvesterBase):
                 extra_values["inchi"], extra_values["inchi_key"])
             if image_path:
                 extra_values["chemical_image_path"] = image_path
+                # The existing NFDI4Chem UI resolves depictions from this
+                # legacy CKAN storage URL convention.
+                extra_values["image_url"] = "/storage/images/%s.png" % (
+                    extra_values["inchi_key"])
 
             measurement_info = self._measurement_info(content)
             if measurement_info:
@@ -664,9 +668,11 @@ class ChemDCATAPHarvester(HarvesterBase):
                 if transaction.is_active:
                     transaction.rollback()
                 return False
+            if image_path and extra_values.get("image_url"):
+                package["image_url"] = extra_values["image_url"]
             synchronize_harvested_package(
                 package, harvest_object,
-                names=[title, extra_values.get("iupac_name")],
+                names=self._molecule_names(content),
                 name_source="Chemotion",
             )
             if transaction.is_active:
@@ -710,6 +716,56 @@ class ChemDCATAPHarvester(HarvesterBase):
                           previous_object.package_id, harvest_object.guid,
                           exc_info=True)
         return None
+
+    @classmethod
+    def _molecule_names(cls, content):
+        """Return the chemical entity's IUPAC/alternate names, never dataset titles."""
+        def chemical_values(value):
+            if isinstance(value, dict):
+                # ChemDCAT-AP typed literals may carry a label/type beside
+                # their actual value; only the literal's value is a name.
+                if value.get("value") is not None:
+                    return cls._strings(value["value"])
+                return cls._strings(value.get("name") or value.get("title") or
+                                    value.get("@value"))
+            if isinstance(value, list):
+                result = []
+                for item in value:
+                    result.extend(chemical_values(item))
+                return result
+            return cls._strings(value)
+
+        preferred, other = [], []
+        for node in cls._walk_nodes(content):
+            node_type = cls._strings(node.get("@type") or node.get("type"))
+            if any(cls._key_token(value).lower() == "chemicalentity"
+                   for value in node_type):
+                for key in ("iupac_name", "iupacName", "alternate_name",
+                            "alternateName", "alternate_names", "alternateNames",
+                            "name", "preferred_label", "preferredLabel", "title"):
+                    value = node.get(key)
+                    if value:
+                        preferred.extend(chemical_values(value))
+            elif any(cls._key_token(value).lower() == "substancesample"
+                     for value in node_type):
+                # The sample label (e.g. CRS-7615) is only a fallback after
+                # chemical entity names, never the measurement dataset title.
+                for key in ("alternate_name", "alternateName", "name", "title"):
+                    value = node.get(key)
+                    if value:
+                        other.extend(chemical_values(value))
+        # Some API revisions omit @type on nested chemical nodes.
+        if not preferred:
+            for value in cls._all_values(content, "iupac_name", "iupacName"):
+                preferred.extend(chemical_values(value))
+        result, seen = [], set()
+        for value in preferred + other:
+            value = value.strip()
+            token = value.casefold()
+            if value and token not in seen:
+                result.append(value)
+                seen.add(token)
+        return result
 
     def _tags(self, content):
         values = []
