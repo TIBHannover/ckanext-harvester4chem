@@ -1,6 +1,7 @@
-"""CKAN harvester for Chemotion's ChemDCAT-AP API (v5)."""
+"""CKAN harvester for Chemotion's ChemDCAT-AP API (v8)."""
 import json
 import logging
+import os
 import re
 import time
 import traceback
@@ -14,6 +15,11 @@ from ckan.logic import get_action
 from ckan.model import Session
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckanext.harvest.model import HarvestObject
+from ckanext.harvester4chem.license_utils import apply_license
+from ckanext.harvester4chem.molecule_sync import (
+    normalize_structure,
+    synchronize_harvested_package,
+)
 
 log = logging.getLogger(__name__)
 
@@ -296,7 +302,7 @@ class ChemDCATAPHarvester(HarvesterBase):
 
     @classmethod
     def _license_candidates(cls, content):
-        values = cls._all_values(content, "license", "license_id", "rights",
+        values = cls._all_values(content, "license", "licence", "license_id", "rights",
                                  "accessRights", "access_rights")
         candidates = []
         for value in values:
@@ -389,6 +395,93 @@ class ChemDCATAPHarvester(HarvesterBase):
                 result.append(record)
         return result
 
+    @classmethod
+    def _expand_curie(cls, value):
+        """Expand ontology CURIEs used by ChemDCAT-AP, leaving URLs intact."""
+        if not value:
+            return None
+        value = str(value).strip()
+        if value.startswith(("http://", "https://")):
+            return value
+        prefixes = {
+            "CHMO": "http://purl.obolibrary.org/obo/CHMO_",
+            "CHEBI": "http://purl.obolibrary.org/obo/CHEBI_",
+            "OBI": "http://purl.obolibrary.org/obo/OBI_",
+            "QUDT": "http://qudt.org/vocab/quantitykind/",
+        }
+        if ":" not in value:
+            return None
+        prefix, local = value.split(":", 1)
+        base = prefixes.get(prefix.upper())
+        return base + local if base and local else None
+
+    @classmethod
+    def _measurement_info(cls, content):
+        """Read technique labels/ontology IDs and preserve related activity data."""
+        measurements = []
+        activities = cls._all_values(content, "was_generated_by")
+        flattened = []
+        for activity in activities:
+            if isinstance(activity, list):
+                flattened.extend(activity)
+            else:
+                flattened.append(activity)
+        for activity in flattened:
+            if not isinstance(activity, dict):
+                continue
+            concept = activity.get("rdf_type") or activity.get("rdf:type") or {}
+            if not isinstance(concept, dict):
+                concept = {"id": concept}
+            concept_id = cls._text(concept.get("id") or concept.get("@id"))
+            label = cls._text(concept.get("title") or activity.get("title"))
+            activity_description = cls._text(activity.get("description"))
+            measurements.append({
+                "technique": label,
+                "technique_id": concept_id,
+                "technique_iri": cls._expand_curie(concept_id),
+                "activity_id": cls._text(activity.get("id") or activity.get("@id")),
+                "description": activity_description,
+                "evaluated_entity": activity.get("evaluated_entity", []),
+            })
+        return measurements
+
+    @classmethod
+    def _molar_mass(cls, content):
+        """Extract a value from the ChemDCAT-AP has_molar_mass node."""
+        for node in cls._walk_nodes(content):
+            for key, value in node.items():
+                if cls._key_token(key) != "hasmolarmass":
+                    continue
+                for child in cls._walk_nodes(value):
+                    if child.get("value") is not None:
+                        return child.get("value")
+        return None
+
+    @staticmethod
+    def _generate_chemical_image(inchi_value, inchikey):
+        """Create the same local RDKit depiction used by the legacy harvester."""
+        if not inchi_value or not inchikey or not str(inchi_value).startswith("InChI"):
+            return None
+        try:
+            from ckan.common import config as ckan_config
+            from rdkit.Chem import Draw, inchi as rdkit_inchi
+
+            storage_path = ckan_config.get(
+                "ckan.storage_path", "/var/lib/ckan/default/storage")
+            image_dir = os.path.join(storage_path, "images")
+            os.makedirs(image_dir, exist_ok=True)
+            image_path = os.path.join(image_dir, str(inchikey) + ".png")
+            molecule = rdkit_inchi.MolFromInchi(str(inchi_value))
+            if molecule is None:
+                log.warning("RDKit could not create a molecule from InChI %s", inchikey)
+                return None
+            if not os.path.isfile(image_path):
+                Draw.MolToFile(molecule, image_path, size=(400, 400))
+            return image_path
+        except Exception:
+            log.exception("Could not generate chemical depiction for %s", inchikey)
+            return None
+
     @staticmethod
     def _text(value):
         if isinstance(value, dict):
@@ -438,11 +531,30 @@ class ChemDCATAPHarvester(HarvesterBase):
                 "molecular_formula": self._text(self._value(content, "molecular_formula")),
                 "iupac_name": self._text(self._value(content, "iupac_name")),
                 "image_url": image_url,
+                "exactmass": self._molar_mass(content),
             }
+            extra_values["mol_formula"] = extra_values["molecular_formula"]
+            extra_values["iupacName"] = extra_values["iupac_name"]
+            image_path = self._generate_chemical_image(
+                extra_values["inchi"], extra_values["inchi_key"])
+            if image_path:
+                extra_values["chemical_image_path"] = image_path
+
+            measurement_info = self._measurement_info(content)
+            if measurement_info:
+                first_measurement = measurement_info[0]
+                extra_values["measurement_technique"] = first_measurement.get("technique")
+                extra_values["measurement_technique_iri"] = first_measurement.get("technique_iri")
             measurement_data = self._measurement_data(content)
-            if measurement_data:
+            measurement_payload = {
+                "techniques": measurement_info,
+                "attributes_and_relations": measurement_data,
+                "dataset_description": self._text(
+                    self._value(dataset, "description", "abstract")),
+            }
+            if measurement_info or measurement_data or measurement_payload["dataset_description"]:
                 extra_values["chemdcat_measurement_data"] = json.dumps(
-                    measurement_data, ensure_ascii=False)
+                    measurement_payload, ensure_ascii=False)
             license_candidates = (self._license_candidates(dataset) or
                                   self._license_candidates(content))
             if license_candidates:
@@ -496,7 +608,9 @@ class ChemDCATAPHarvester(HarvesterBase):
             # These mirrors support installed CKAN chemical-structure plugins
             # that look for package fields in addition to package extras.
             for key in ("inchi", "inchikey", "inchi_key", "smiles",
-                        "molecular_formula", "iupac_name", "doi", "image_url"):
+                        "molecular_formula", "mol_formula", "exactmass",
+                        "iupac_name", "iupacName", "doi", "image_url",
+                        "measurement_technique", "measurement_technique_iri"):
                 value = extra_values.get(key)
                 if value not in (None, "", [], {}):
                     package[key] = value
@@ -506,7 +620,16 @@ class ChemDCATAPHarvester(HarvesterBase):
                 context.copy(), {"id": harvest_object.source.id})
             package["owner_org"] = source.get("owner_org")
 
-            if license_candidates:
+            license_value = self._value(content, "licence", "license")
+            if license_value:
+                try:
+                    # Use the repository's shared license mapper, as the
+                    # legacy Chemotion harvester does, then use the local
+                    # catalog matcher as a fallback.
+                    apply_license(package, license_value, context)
+                except Exception:
+                    log.exception("Shared Chemotion license mapping failed")
+            if license_candidates and not package.get("license_id"):
                 try:
                     license_items = get_action("license_list")(context.copy(), {})
                     license_id = self._license_id_for(license_candidates, license_items)
@@ -530,10 +653,25 @@ class ChemDCATAPHarvester(HarvesterBase):
             if modified:
                 package["metadata_modified"] = self._text(modified)
 
+            normalize_structure(
+                package.get("inchi"), package.get("inchi_key"),
+                package.get("smiles"), package.get("mol_formula"),
+                package.get("exactmass"))
+            transaction = Session.begin_nested()
             result = self._create_or_update_package(
                 package, harvest_object, "package_show")
             if result is None or result is False:
+                if transaction.is_active:
+                    transaction.rollback()
                 return False
+            synchronize_harvested_package(
+                package, harvest_object,
+                names=[title, extra_values.get("iupac_name")],
+                name_source="Chemotion",
+            )
+            if transaction.is_active:
+                transaction.commit()
+            Session.commit()
             # _create_or_update_package returns True for a change and
             # 'unchanged' when the existing record already matches.
             return result
@@ -590,19 +728,28 @@ class ChemDCATAPHarvester(HarvesterBase):
     def _resources(self, content, title):
         resources, seen_urls = [], set()
 
+        def direct_value(item, *keys):
+            if not isinstance(item, dict):
+                return None
+            wanted = set(self._key_token(key) for key in keys)
+            for key, value in item.items():
+                if self._key_token(key) in wanted and value not in (None, "", [], {}):
+                    return value
+            return None
+
         def add_resource(item, default_name, default_format):
             if isinstance(item, str):
                 url = item
                 name = default_name
                 fmt = default_format
             elif isinstance(item, dict):
-                url = self._value(item, "download_url", "downloadURL", "access_url",
-                                  "accessURL", "url", "@id", "id", "value")
+                url = direct_value(item, "download_url", "downloadURL", "access_url",
+                                   "accessURL", "url", "@id", "id", "value")
                 if isinstance(url, dict):
-                    url = self._value(url, "@id", "id", "url", "value")
-                name = self._text(self._value(item, "title", "name")) or default_name
-                fmt = self._text(self._value(item, "encodingFormat", "mediaType",
-                                             "mimeType", "format")) or default_format
+                    url = direct_value(url, "@id", "id", "url", "value")
+                name = self._text(direct_value(item, "title", "name")) or default_name
+                fmt = self._text(direct_value(item, "encodingFormat", "mediaType",
+                                              "mimeType", "format")) or default_format
             else:
                 return
             if not url or not str(url).startswith(("http://", "https://")):
@@ -624,7 +771,8 @@ class ChemDCATAPHarvester(HarvesterBase):
             resources.append({"url": url, "name": name, "format": fmt})
 
         # DCAT distributions can contain links to the actual measurement files.
-        for distribution in self._all_values(content, "distribution", "distributions"):
+        for distribution in self._all_values(
+                content, "distribution", "distributions", "dataset_distribution"):
             values = distribution if isinstance(distribution, list) else [distribution]
             for item in values:
                 add_resource(item, title, "Unknown")
