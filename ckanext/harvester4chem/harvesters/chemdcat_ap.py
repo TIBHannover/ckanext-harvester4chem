@@ -466,6 +466,23 @@ class ChemDCATAPHarvester(HarvesterBase):
             # Use the source + gathered GUID so every rerun updates this record.
             remote_key = "%s:%s" % (harvest_object.source.id, harvest_object.guid)
             package_id = str(uuid.uuid5(uuid.NAMESPACE_URL, remote_key))
+            # Add a stable remote-ID suffix to new package names. CKAN's
+            # name-availability check can race when import workers create
+            # records concurrently; the suffix also separates distinct
+            # Chemotion records that normalize to the same identifier slug.
+            name = "%s-%s" % (name[:90].rstrip("-"),
+                               package_id.replace("-", "")[:8])
+
+            # Older harvester versions may have created this same remote
+            # record with a CKAN-generated package ID. Harvest's base helper
+            # searches by package ID, so the deterministic ID above would not
+            # find that package and CKAN could then reject its already-used
+            # name. Reuse the linked ID only when both source and GUID match.
+            previous_package = self._existing_package_for_guid(harvest_object)
+            if previous_package:
+                package_id = previous_package["id"]
+                name = previous_package.get("name") or name
+
             package = {
                 "id": package_id,
                 "name": name,
@@ -527,6 +544,34 @@ class ChemDCATAPHarvester(HarvesterBase):
                 "Import failed for %s: %s / %s" %
                 (harvest_object.guid, exc, traceback.format_exc()), harvest_object)
             return False
+
+    @staticmethod
+    def _existing_package_for_guid(harvest_object):
+        """Find a prior package linked to this exact source and remote GUID."""
+        source_id = harvest_object.source.id
+        objects = (Session.query(HarvestObject)
+                   .filter(HarvestObject.guid == harvest_object.guid)
+                   .all())
+        for previous_object in objects:
+            if previous_object.id == harvest_object.id:
+                continue
+            try:
+                same_source = previous_object.source.id == source_id
+            except AttributeError:
+                same_source = False
+            if not same_source or not previous_object.package_id:
+                continue
+            context = {"model": model, "session": Session,
+                       "ignore_auth": True}
+            try:
+                return get_action("package_show")(
+                    context, {"id": previous_object.package_id})
+            except Exception:
+                # A stale harvest-object link should not block package import.
+                log.debug("Prior package link %s for GUID %s is unavailable",
+                          previous_object.package_id, harvest_object.guid,
+                          exc_info=True)
+        return None
 
     def _tags(self, content):
         values = []
