@@ -25,6 +25,10 @@ log = logging.getLogger(__name__)
 
 
 class ChemDCATAPHarvester(HarvesterBase):
+    # Expectation: only syntactically valid Chemotion publication IDs and
+    # InChIKeys enter the queue; malformed listing values are skipped early.
+    _INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
+
     def info(self):
         return {
             "name": "chemdcat_ap",
@@ -87,7 +91,21 @@ class ChemDCATAPHarvester(HarvesterBase):
             if query.get(key):
                 return "publication_id", query[key][0]
         if query.get("inchikey"):
-            return "inchikey", query["inchikey"][0]
+            candidate = query["inchikey"][0]
+            key_part, separator, suffix = candidate.partition("/")
+            if (ChemDCATAPHarvester._INCHIKEY_RE.fullmatch(key_part.upper()) and
+                    (not separator or re.fullmatch(r"[A-Za-z0-9._-]+", suffix))):
+                return "inchikey", candidate
+            log.warning("Skipping invalid InChIKey in Chemotion listing: %r", candidate)
+            return None, None
+        if value.lower().startswith("inchikey:"):
+            candidate = value.split(":", 1)[1]
+            key_part, separator, suffix = candidate.partition("/")
+            if (ChemDCATAPHarvester._INCHIKEY_RE.fullmatch(key_part.upper()) and
+                    (not separator or re.fullmatch(r"[A-Za-z0-9._-]+", suffix))):
+                return "inchikey", candidate
+            log.warning("Skipping invalid InChIKey in Chemotion listing: %r", candidate)
+            return None, None
         match = re.search(r"/pid/([^/?#]+)", value)
         if match:
             return "publication_id", match.group(1)
@@ -112,6 +130,11 @@ class ChemDCATAPHarvester(HarvesterBase):
                 url, params=params, timeout=timeout,
                 headers={"Accept": "application/ld+json, application/json"})
             if response.status_code not in (429, 500, 502, 503, 504):
+                if response.status_code == 422:
+                    # Chemotion's validation body usually identifies the
+                    # rejected query parameter; retain it for diagnosis.
+                    log.error("Chemotion rejected request %s with HTTP 422: %s",
+                              response.url, response.text[:2000])
                 response.raise_for_status()
                 return response
             if attempt >= retries:
@@ -196,6 +219,13 @@ class ChemDCATAPHarvester(HarvesterBase):
                 query_parameter, identifier = "publication_id", guid
             if query_parameter not in ("publication_id", "inchikey"):
                 raise ValueError("Unsupported Chemotion record identifier")
+            if query_parameter == "inchikey":
+                key_part, separator, suffix = identifier.partition("/")
+                if (not self._INCHIKEY_RE.fullmatch(key_part.upper()) or
+                        (separator and not re.fullmatch(r"[A-Za-z0-9._-]+", suffix))):
+                    raise ValueError(
+                        "Invalid InChIKey GUID; expected a standard InChIKey "
+                        "optionally followed by /<publication-id>")
             response = self._get_response(
                 endpoint, {query_parameter: identifier},
                 float(config.get("timeout", 30)),
@@ -684,9 +714,21 @@ class ChemDCATAPHarvester(HarvesterBase):
         except Exception as exc:
             Session.rollback()
             log.exception("ChemDCAT-AP import failed for %s", harvest_object.guid)
+            error_text = str(exc)
+            traceback_text = traceback.format_exc()
+            if ("relationship_relation_delete" in traceback_text or
+                    ("name" in error_text and "relationship" in traceback_text.lower())):
+                # Expectation: ckanext-relationship's after_update hook passes
+                # the required relation name to relationship_relation_delete.
+                # That hook is outside this harvester and must be fixed or
+                # upgraded in the CKAN environment before package updates pass.
+                error_text += (
+                    " | ckanext-relationship after_update failed: its "
+                    "relationship_relation_delete call must include the "
+                    "required name; fix/upgrade that extension and retry")
             self._save_object_error(
                 "Import failed for %s: %s / %s" %
-                (harvest_object.guid, exc, traceback.format_exc()), harvest_object)
+                (harvest_object.guid, error_text, traceback_text), harvest_object)
             return False
 
     @staticmethod
